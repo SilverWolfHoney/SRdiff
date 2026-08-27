@@ -144,6 +144,23 @@ def set_config_version(gamedir, tag):
         cfg.write_bytes("".join(lines).encode("utf-8"))
         print(f"  [config] game_version -> {tag}")
 
+def ask_clean_cache():
+    # 交互: 问用户是否清理缓存目录; 用户说删就删(默认不删)
+    if not CACHE_DIR.is_dir():
+        return
+    files = [f for f in CACHE_DIR.iterdir() if f.is_file()]
+    if not files:
+        return
+    try:
+        ans = input(f"\n检测到 sophon_cache 缓存 {len(files)} 个文件, 是否删除清理? [y/N]: ").strip().lower()
+    except EOFError:
+        return
+    if ans in ("y", "yes"):
+        for f in files:
+            try: f.unlink()
+            except Exception: pass
+        print("  缓存已清理。")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--branch", default="main")
@@ -186,6 +203,7 @@ def main():
         print("(--dry 预览, 未下载未写文件)")
     else:
         set_config_version(gamedir, br["tag"])
+        ask_clean_cache()
 
 if __name__ == "__main__":
     main()
