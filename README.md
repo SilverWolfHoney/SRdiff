@@ -6,7 +6,7 @@
 
 ## 原理
 官方(米哈游) Sophon 系统按 **chunks** 分发游戏文件：
-- `getGameBranches` → 拿到目标版本（如 4.5.0）的 `package_id/password/branch/tag`
+- `getGameBranches` → 拿到目标版本的 `package_id/password/branch/tag`
 - `getBuild` → 该版本所有文件的 manifest（含每个文件的 chunks 清单、下载基址、md5）
 - 每个文件由若干 **chunks**（zstd 压缩的片段）组成，按偏移拼合即得完整文件
 
@@ -55,5 +55,5 @@ python sophon_update.py --gamedir "<低版本客户端根目录>" --cat 10055   
 - 覆盖前会替换同名文件，**建议先整体备份客户端**；跑完启动游戏确认（若触发其它资源下载，交给官方 launcher 补即可）。
 - 跑完工具自动把 `config.ini` 的 `game_version` 改为目标版本。
 - **只更新游戏资源(10054) 游戏就能进**；语音包(10055 等) 可选，缺了只影响新内容配音。
-- 工具从官方 `getGameBranches` 自动读取最新目标版本，**同一工具可反复用于后续版本升级**（4.5→4.6、4.6→4.7…）。
+- 工具从官方 `getGameBranches` 自动读取最新目标版本，**同一工具可反复用于后续版本升级**。
 
