@@ -1,2 +1,58 @@
-# SRdiff
-srdiff
+# SRdiff —— 星穹铁道(国服) 低版本→高版本 完整更新器 (Python / Sophon)
+
+用官方 **Sophon** 更新机制，把低版本客户端升级到高版本。**唯一工具是 Python 脚本**，独立完成，无需 hpatchz / ldiff / 其它工具。
+
+## 原理
+官方(米哈游) Sophon 系统按 **chunks** 分发游戏文件：
+- `getGameBranches` → 拿到目标版本（如 4.5.0）的 `package_id/password/branch/tag`
+- `getBuild` → 该版本所有文件的 manifest（含每个文件的 chunks 清单、下载基址、md5）
+- 每个文件由若干 **chunks**（zstd 压缩的片段）组成，按偏移拼合即得完整文件
+
+本工具遍历 manifest，对「当前安装里**缺失或内容不符**」的文件：**下载其 chunks → zstd 解压 → 按偏移组装 → md5 校验 → 写回**；已正确的自动跳过。**跑完自动把 `config.ini` 的版本写成目标版本**，让启动器显示正确。
+
+> 删过「过往资源」也没问题：缺的文件按 4.5 清单直接从官方下载重建，不依赖本地旧文件。
+
+## 依赖
+```
+pip install protobuf zstandard
+```
+`manifest_pb2.py` 由 `gen_pb2.py` 生成（`manifest*.proto` 已提供）。manifest 会缓存到 `sophon_cache\`，重跑秒读。
+
+## 用法
+```bash
+# ★中文版(推荐): 升 游戏资源(10054)+中文语音(10055), 不装英/日/韩
+python sophon_update.py --gamedir "<低版本客户端根目录>" --cn
+
+# 全量: 游戏资源 + 中/英/日/韩 全部
+python sophon_update.py --gamedir "<低版本客户端根目录>"
+
+# 只升单类
+python sophon_update.py --gamedir "<低版本客户端根目录>" --cat 10054   # 游戏资源
+python sophon_update.py --gamedir "<低版本客户端根目录>" --cat 10055   # 中文语音
+```
+- `--gamedir`：要升级的低版本客户端根目录（含 `StarRail_Data\`）
+- `--cat`：只跑指定类别；`--cn`：只跑 资源+中文；都不加=全部
+- `--dry`：只统计、不下载不写文件（建议先跑一次看量）
+
+## 各类别
+| 类别 | 内容 |
+|---|---|
+| 10054 | 游戏资源（主体，必需） |
+| 10055 / 10056 / 10057 / 10058 | 中 / 英 / 日 / 韩 语音 |
+
+## 性能和健壮性
+- chunks **多线程并发下载**（默认 `WORKERS=12`，文件顶部可调；慢网络靠并发提速）。
+- **自动重试**（`DL_RETRIES=6`），偶发断连/SSL 错误自愈。
+- manifest **本地缓存**，重跑不重复下载。
+- **断点续传**：已写对的文件自动跳过，中断后重跑接着补。
+
+## 说明 / 注意
+- 只更新「缺失或变化」的文件（正确跳过），体积 ≈ 一次真实更新。
+- 每文件按官方 md5 校验，不过则警告跳过，不写入错误内容。
+- 覆盖前会替换同名文件，**建议先整体备份客户端**；跑完启动游戏确认（若触发其它资源下载，交给官方 launcher 补即可）。
+- 跑完工具自动把 `config.ini` 的 `game_version` 改为目标版本。
+- **只更新游戏资源(10054) 游戏就能进**；语音包(10055 等) 可选，缺了只影响新内容配音。
+
+## 参考的本机路径
+- 低版本客户端：`E:\HSRBetaPS\Star Rail Game`；已升级目标：`E:\miHoYo Launcher\games\Star Rail Game`
+- 目标版本：`getGameBranches` 返回 `tag=4.5.0, diff_tags=["4.4.0"]`
