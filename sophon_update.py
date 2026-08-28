@@ -84,34 +84,36 @@ def process_category(cat, gamedir, dry):
     chunk_prefix = cat["chunk_download"]["url_prefix"]
     print(f"\n=== [{cid}] {cname} ===")
     man = load_manifest(cat["manifest"], cat["manifest_download"]["url_prefix"])
-    print(f"  文件数: {len(man.files)}  (并发下载: {WORKERS} 线程)")
-    n_new=0; n_skip=0; n_mismatch=0
-    # 每个文件一组并发下载; zctx 不线程安全, 用每线程独立解压器
+    total_files = len(man.files)
+    print(f"  清单文件数: {total_files}  (并发下载: {WORKERS} 线程)")
+    # ---- 第一遍: 统计需要组装的(缺失或内容不符), 拿到"总共需组装" ----
+    print("  正在统计需要更新的文件 ...")
+    need = []
+    n_skip = 0
     for fi in man.files:
-        rel = fi.filename
-        dst = gamedir / rel
+        dst = gamedir / fi.filename
         if dst.is_file() and dst.stat().st_size == fi.size:
-            if dry:
+            if dry:                     # dry 只按大小估算(快)
                 n_skip += 1; continue
             try:
                 if hashlib.md5(dst.read_bytes()).hexdigest().lower() == fi.md5.lower():
                     n_skip += 1; continue
             except Exception:
                 pass
-            n_mismatch += 1
-        else:
-            n_mismatch += 1
-        if not fi.chunks:
-            n_skip += 1; continue
-        if dry:
-            n_new += 1
-            if n_new % 500 == 0:
-                print(f"  将组装 {n_new} ...")
-            continue
+        if fi.chunks:
+            need.append(fi)
+    total_to_assemble = len(need)
+    print(f"  总共需要组装: {total_to_assemble}  (已正确跳过 {n_skip})")
+    if dry:
+        print(f"  [dry] 将组装 {total_to_assemble} 个 (未下载未写文件)")
+        return total_to_assemble
+    # ---- 第二遍: 逐文件组装下载 ----
+    t0 = time.time()
+    n_new = 0
+    for fi in need:
+        rel = fi.filename
+        dst = gamedir / rel
         buf = bytearray(fi.size)
-        # 每文件开始组装时打印, 便于观察是否在动
-        if len(fi.chunks) >= 1:
-            print(f"  组装 {rel} [{len(fi.chunks)} chunks] ...", end="\r")
         # 并发下载+解压该文件的所有 chunks
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
             results = list(ex.map(lambda c: fetch_chunk(c, chunk_prefix), fi.chunks))
@@ -122,9 +124,9 @@ def process_category(cat, gamedir, dry):
         dst.parent.mkdir(parents=True, exist_ok=True)
         with open(dst, "wb") as fh: fh.write(buf)
         n_new += 1
-        if n_new % 50 == 0:
-            print(f"  已组装 {n_new} ...")
-    print(f"  [{cid}] 完成: 新增/重组 {n_new}  内容变化 {n_mismatch}  跳过(已正确) {n_skip}")
+        print(f"[{time.strftime('%H:%M:%S')}] 已组装 {n_new} / {total_to_assemble}  · {rel}")
+    el = time.time() - t0
+    print(f"  [{cid}] 完成: 已组装 {n_new}/{total_to_assemble}  已正确跳过 {n_skip}  耗时 {el:.0f}s")
     return n_new
 
 def set_config_version(gamedir, tag):
@@ -196,9 +198,11 @@ def main():
         print("  中文版模式: 仅 游戏资源(10054) + 中文语音(10055)")
 
     total=0
+    start_all = time.time()
     for cat in cats:
         total += process_category(cat, gamedir, a.dry)
-    print(f"\n== 全部完成 == 共处理类别 {len(cats)} 个, 新增/重组文件合计: {total} 个, 目标版本 {br['tag']}")
+    el_all = time.time() - start_all
+    print(f"\n== 全部完成 == 共处理类别 {len(cats)} 个, 新增/重组文件合计: {total} 个, 目标版本 {br['tag']}, 总耗时 {el_all:.0f}s ({el_all/60:.1f} 分钟)")
     if a.dry:
         print("(--dry 预览, 未下载未写文件)")
     else:
