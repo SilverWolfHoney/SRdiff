@@ -27,6 +27,34 @@ def http(url, post=None):
     with urllib.request.urlopen(req, timeout=90) as r:
         return json.load(r)
 
+def dl_full(url, verbose=False):
+    # 完整下载一个文件(chunk), 带重试
+    last = None
+    for attempt in range(DL_RETRIES):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Dsh-SophonLdiff/1.0"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                buf = bytearray()
+                while True:
+                    b = r.read(1 << 20)
+                    if not b:
+                        break
+                    buf += b
+                return bytes(buf)
+        except Exception as e:
+            last = e
+            if verbose:
+                print(f"    [重试{attempt+1}/{DL_RETRIES}] {e}")
+            time.sleep(1 + attempt * 2)
+    raise last
+
+def fetch_chunk(chunk, chunk_prefix):
+    # 下载+解压单个 chunk -> (offset, data); 用流式 decompressobj 兼容帧头无内容大小的 zstd
+    raw = dl_full(chunk_prefix + "/" + chunk.chunk_id)
+    dec = zstandard.ZstdDecompressor().decompressobj()
+    data = dec.decompress(raw) + dec.flush()
+    return chunk.offset, data
+
 def dl_range(url, start, length, verbose=False):
     # 只取补丁文件里的一个片段: 官方 CDN 支持 HTTP Range, 不用为整个补丁池付流量
     last = None
@@ -106,10 +134,15 @@ def local_version(gamedir):
 def human(n):
     return f"{n/2**30:.2f} GiB" if n >= 2**30 else f"{n/2**20:.1f} MiB"
 
-def collect(cat, src, dry, outdir, workers, limit=0):
+def collect(cat, src, dry, outdir, workers, limit=0, src_man=None, tgt_dl=None,
+            tgt_files=None, with_new=False, chunk_prefix=None):
     """
     处理一个类别: 解析官方差分清单, 取"本地版本 -> 目标版本"的补丁段,
     按补丁池分组下载并落盘。返回统计信息 dict。
+    src_man:  本地版本该类别对应的 chunk 清单, 用来算出哪些文件是"新增"的
+    tgt_dl:   目标版本 文件名 -> 压缩下载体积, 用来算新增文件要下多少
+    tgt_files:目标版本 文件名 -> FileInfo, with_new 时按它下载新增文件的完整内容
+    chunk_prefix: 目标版本该类别的 chunk 下载基址(getPatchBuild 里没有, 要从 getBuild 取)
     """
     from manifest_ldiff_pb2 import DiffManifest
     cid = cat["category_id"]
@@ -157,13 +190,36 @@ def collect(cat, src, dry, outdir, workers, limit=0):
 
     dl_bytes = sum(pat.patch_length for _v, pat in picked)
     new_bytes = sum(v.size for v, _pat in picked)
-    print(f"  改动文件 {len(picked)} 个 (其中 {skipped_nosrc} 个源文件本就不存在, 可直接重建)")
-    print(f"  未改动/不适用 {skipped_unchanged} 个")
-    print(f"  补丁池 {len(pools)} 个, 需下载 {human(dl_bytes)} (仅补丁段), 应用后产出 {human(new_bytes)}")
+
+    # ---- 目标版本里"本地版本没有"的文件 => 新增文件, 没有补丁, 只能全量下载 ----
+    # 注: "补丁覆盖"与"内容改动"是两件事 —— original_hash 为空的补丁同样是从零重建,
+    #     所以这里用"源清单里有没有这个文件"来界定"新增", 与是否有补丁无关。
+    n_added = 0
+    added_dl = 0
+    new_names = []
+    if src_man is not None and tgt_dl is not None:
+        src_names = {f.filename for f in src_man.files}
+        for v in dm.files:
+            if v.filename not in src_names:
+                n_added += 1
+                added_dl += tgt_dl.get(v.filename, 0)
+                new_names.append(v.filename)
+
+    n_content = len(picked) - skipped_nosrc      # 本地存在且内容改动的文件
+    n_rebuild = skipped_nosrc                    # 本地缺失、但补丁能直接重建的文件
+    print(f"  补丁覆盖 {len(picked)} 个文件: 本地需改动 {n_content} 个, "
+          f"本地缺失可重建 {n_rebuild} 个")
+    print(f"  无需处理(目标版本未改动) {skipped_unchanged} 个")
+    print(f"  补丁池 {len(pools)} 个, 补丁段需下载 {human(dl_bytes)}, 应用后产出 {human(new_bytes)}")
+    if n_added:
+        print(f"  [注意] 另有 {n_added} 个文件是你本地没有、官方也没给补丁的(新增),")
+        print(f"         共 {human(added_dl)}: 差分包覆盖不了, 必须全量下载")
 
     if dry:
-        return {"files": len(picked), "pools": len(pools), "dl": dl_bytes,
-                "new": new_bytes, "records": [], "deletes": dm.files_delete, "dry": True}
+        return {"files": len(picked), "pools": len(pools), "dl": dl_bytes, "new": new_bytes,
+                "added_dl": added_dl, "n_added": n_added, "n_content": n_content,
+                "new_files": [], "n_new_bundled": 0, "new_bundled_bytes": 0,
+                "records": [], "deletes": dm.files_delete, "dry": True}
 
     # ---- 磁盘预检 ----
     try:
@@ -246,16 +302,57 @@ def collect(cat, src, dry, outdir, workers, limit=0):
                 "original_md5": pat.original_hash.lower(),
             })
 
+    new_records = []
+    new_bundled_bytes = 0
+    el_pool = 0.0
     with ThreadPoolExecutor(max_workers=workers) as ex:
         list(ex.map(do_pool, pools.items()))
+        el_pool = time.time() - t0
+
+        # ---- --with-new: 把新增文件也整份下进包里(它们没有补丁, 只能全量带过去) ----
+        if with_new and new_names and tgt_files:
+            if not chunk_prefix:
+                print("  [错误] 缺少 chunk 下载地址, 无法打包新增文件"); return None
+            files_dir = outdir / "files"
+            files_dir.mkdir(parents=True, exist_ok=True)
+            print(f"  开始下载新增文件 {len(new_names)} 个 ({human(added_dl)} 压缩) ...")
+            t1 = time.time()
+            fdone = 0
+            for name in new_names:
+                fi = tgt_files.get(name)
+                if fi is None:
+                    continue
+                dst = files_dir / fi.filename
+                if dst.is_file() and dst.stat().st_size == fi.size:
+                    new_bundled_bytes += dst.stat().st_size      # 断点续传: 大小对上就跳过
+                else:
+                    buf = bytearray(fi.size)
+                    results = list(ex.map(lambda c: fetch_chunk(c, chunk_prefix), fi.chunks))
+                    for off, data in results:
+                        buf[off:off + len(data)] = data
+                    if hashlib.md5(buf).hexdigest().lower() != fi.md5.lower():
+                        print(f"  [警告] 新增文件校验失败, 跳过: {fi.filename}"); continue
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    with open(dst, "wb") as fh:
+                        fh.write(buf)
+                    new_bundled_bytes += fi.size
+                new_records.append({"filename": fi.filename, "size": fi.size, "md5": fi.md5.lower()})
+                fdone += 1
+                if fdone % 20 == 0 or fdone == len(new_names):
+                    print(f"[{time.strftime('%H:%M:%S')}] 新增文件 {fdone} / {len(new_names)} · {name}")
+            print(f"  新增文件完成: {fdone} 个, 耗时 {time.time()-t1:.0f}s")
 
     el = time.time() - t0
-    print(f"  [{cid}] 完成: {len(picked)} 个文件, {len(pools)} 个补丁池, 耗时 {el:.0f}s")
+    print(f"  [{cid}] 完成: 补丁 {len(picked)} 个文件 / {len(pools)} 个池 耗时 {el_pool:.0f}s"
+          + (f"; 新增文件 {len(new_records)} 个 耗时 {el-el_pool:.0f}s" if with_new else ""))
     if gaps[0]:
         print(f"  [提示] 补丁池内有 {human(gaps[0])} 空隙(补零填充), 导出体积略大于纯补丁段"
               f"(正常完整导出时空隙为 0)")
     return {"files": len(picked), "pools": len(pools), "dl": dl_bytes, "new": new_bytes,
-            "records": records, "deletes": dm.files_delete, "dry": False, "gaps": gaps[0]}
+            "records": records, "deletes": dm.files_delete, "dry": False, "gaps": gaps[0],
+            "added_dl": added_dl, "n_added": n_added, "n_content": n_content,
+            "new_files": new_records, "n_new_bundled": len(new_records),
+            "new_bundled_bytes": new_bundled_bytes}
 
 def delete_list(files_delete, src):
     # 官方规定了本版本需要删除的旧文件, 收集起来交给应用端处理
@@ -265,6 +362,28 @@ def delete_list(files_delete, src):
             continue
         for info in d.info.list:
             out.append(info.filename)
+    return out
+
+def load_src_manifests(src_br, cats):
+    """取本地版本各类别的 chunk 清单, 用于统计"目标版本新增了哪些文件"(这些没有补丁)"""
+    from manifest_pb2 import Manifest
+    out = {}
+    try:
+        bj = get_build(src_br, "getBuild")["data"]
+    except Exception as e:
+        print(f"  (取本地版本 {src_br.get('tag')} 清单失败, 跳过新增文件统计: {e})")
+        return out
+    by_cid = {m["category_id"]: m for m in bj["manifests"]}
+    for cat in cats:
+        m = by_cid.get(cat["category_id"])
+        if not m:
+            continue
+        try:
+            man = Manifest()
+            man.ParseFromString(load_manifest_zst(m["manifest"]["id"], m["manifest_download"]["url_prefix"]))
+            out[cat["category_id"]] = man
+        except Exception as e:
+            print(f"  (类别 {cat['category_id']} 的本地版本清单解析失败, 跳过新增统计: {e})")
     return out
 
 def main():
@@ -280,6 +399,9 @@ def main():
     ap.add_argument("--dry", action="store_true", help="只统计体积, 不下载不写文件")
     ap.add_argument("--limit", type=int, default=0,
                     help="每类最多取多少个补丁池(0=不限); 用于小规模试跑, 会导出不完整的包")
+    ap.add_argument("--with-new", action="store_true", dest="with_new",
+                    help="把新增文件(官方没有补丁)也整份下载打包, 让对方一个包就能离线完成升级; "
+                         "会让导出目录大很多(可自行压缩后再分享)")
     a = ap.parse_args()
 
     gamedir = pathlib.Path(a.gamedir)
@@ -323,29 +445,64 @@ def main():
     if not cats:
         print("找不到类别:", a.cat); sys.exit(1)
 
-    # 目标版本各文件的 md5 索引(用于自检: 导出记录必须与目标清单一致)
+    # 目标版本各文件的 md5 / 压缩体积 / FileInfo(新增文件要整份下载时用得到)
     tgt_md5 = {}
+    tgt_dl = {}
+    tgt_files = {}
+    chunk_prefixes = {}
     for m in tgt_build["manifests"]:
         from manifest_pb2 import Manifest
         man = Manifest()
         man.ParseFromString(load_manifest_zst(m["manifest"]["id"], m["manifest_download"]["url_prefix"]))
+        chunk_prefixes[m["category_id"]] = m["chunk_download"]["url_prefix"]
         for f in man.files:
             tgt_md5[f.filename] = f.md5.lower()
+            tgt_dl[f.filename] = sum(c.compressed_size for c in f.chunks)
+            tgt_files[f.filename] = f
+
+    # 本地版本清单(用来算"新增文件"体积: 它们没有补丁, 差分包覆盖不了)
+    src_br = next((v for v in gb.values()
+                   if isinstance(v, dict) and v.get("tag") == src and v.get("package_id")), None)
+    src_mans = {}
+    if src_br:
+        print(f"  正在获取本地版本 {src} 的清单(用于统计新增文件) ...")
+        src_mans = load_src_manifests(src_br, cats)
 
     start = time.time()
     stats, all_records, all_deletes = [], [], set()
+    all_new_files = []
     for cat in cats:
-        st = collect(cat, src, a.dry, outdir, a.workers, a.limit)
+        st = collect(cat, src, a.dry, outdir, a.workers, a.limit,
+                     src_mans.get(cat["category_id"]), tgt_dl, tgt_files, a.with_new,
+                     chunk_prefixes.get(cat["category_id"]))
+        if st is None:
+            sys.exit(1)
         stats.append(st)
         all_records.extend(st["records"])
+        all_new_files.extend(st.get("new_files") or [])
         all_deletes.update(delete_list(st["deletes"], src))
 
     dl_total = sum(s["dl"] for s in stats)
     new_total = sum(s["new"] for s in stats)
+    added_dl_total = sum(s.get("added_dl", 0) for s in stats)
+    n_added_total = sum(s.get("n_added", 0) for s in stats)
+    n_content_total = sum(s.get("n_content", 0) for s in stats)
+    bund_total = sum(s.get("new_bundled_bytes", 0) for s in stats)
     el = time.time() - start
-    print(f"\n== 汇总 == 类别 {len(cats)} 个, 改动文件 {sum(s['files'] for s in stats)} 个, "
-          f"补丁池 {sum(s['pools'] for s in stats)} 个")
-    print(f"  需下载(仅补丁段): {human(dl_total)}   应用后产出: {human(new_total)}   耗时 {el:.0f}s")
+    print(f"\n== 汇总 == 类别 {len(cats)} 个, 补丁池 {sum(s['pools'] for s in stats)} 个")
+    print(f"  补丁覆盖 {sum(s['files'] for s in stats)} 个文件 "
+          f"(本地需改动 {n_content_total}, 本地缺失可重建 {sum(s.get('n_rebuild', 0) for s in stats)})")
+    print(f"  补丁段需下载: {human(dl_total)}   应用后产出: {human(new_total)}   耗时 {el:.0f}s")
+    if added_dl_total:
+        if all_new_files:
+            print(f"  新增文件 {len(all_new_files)} 个已一并打包(整份内容): {human(bund_total)}")
+        else:
+            print(f"  另有新增文件 {n_added_total} 个(官方无补丁): {human(added_dl_total)} —— 未打包,"
+                  f" 对方仍需从官方全量下载")
+            print(f"         想连它们一起打包, 加 --with-new 重跑(导出目录会更大)")
+    total_dl = dl_total + (bund_total if all_new_files else added_dl_total)
+    print(f"  => 对方拿到这个包后真实下载量 ≈ {human(total_dl)}"
+          + ("" if all_new_files else f" (补丁 {human(dl_total)} + 新增 {human(added_dl_total)})"))
 
     if a.dry:
         print("\n(--dry 预览: 未下载、未写文件)")
@@ -376,14 +533,25 @@ def main():
         "patches": sorted(all_records, key=lambda r: r["filename"]),
         "delete": sorted(all_deletes),
     }
+    if all_new_files:
+        manifest["files_dir"] = "files"
+        manifest["new_files"] = sorted(all_new_files, key=lambda r: r["filename"])
     outdir.mkdir(parents=True, exist_ok=True)
     (outdir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
 
+    _add_line = ""
+    if all_new_files:
+        _add_line = (f"      另有新增文件 {len(all_new_files)} 个, 已整份打包在 files\\ 目录: {human(bund_total)}。\n"
+                     f"      应用脚本会自动把它们复制到客户端。\n")
+    elif added_dl_total:
+        _add_line = (f"      注意: 新增文件 {n_added_total} 个({human(added_dl_total)})不在本包里 ——\n"
+                     f"      官方没有为不存在的文件生成补丁, 它们需要从官方 CDN 全量下载(见文末说明)。\n")
+    _total_dl = dl_total + (bund_total if all_new_files else added_dl_total)
     (outdir / "如何应用.txt").write_text(
         f"""SRdiff 差分包  {src} -> {tgt}
 =====================================
-内容: 官方 Sophon 差分补丁, 共 {len(all_records)} 个文件, 下载体积 {human(dl_total)}。
-      本体在 pool\\ 目录(每个文件是一个"补丁池", 段的位置见 manifest.json)。
+内容: 官方补丁 {len(all_records)} 个文件, 补丁段 {human(dl_total)} (在 pool\\ 目录)。
+{_add_line}      本次 {src} -> {tgt} 真实下载量 ≈ {human(_total_dl)}。
 
 要求: 你的客户端必须是 {src} 版本(未改动过)。补丁按原文件内容生成,
       源文件被改过就会打不上(应用脚本会报出来, 那个文件需要单独全量更新)。
@@ -411,6 +579,8 @@ def main():
     print(f"\n差分包已导出: {outdir}")
     print(f"  {outdir / 'manifest.json'}   ({len(all_records)} 条补丁记录, {len(all_deletes)} 个待删文件)")
     print(f"  {outdir / 'pool'}            ({len(list((outdir / 'pool').iterdir()))} 个补丁池)")
+    if all_new_files:
+        print(f"  {outdir / 'files'}           ({len(all_new_files)} 个新增文件, 整份内容)")
     print(f"  {outdir / '如何应用.txt'}")
     print(f"  别忘了把 apply_ldiff.py 一起打包发给别人")
 

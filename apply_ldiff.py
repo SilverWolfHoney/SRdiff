@@ -6,7 +6,7 @@
 # 用法:
 #   python apply_ldiff.py --gamedir "<客户端根目录>" --pack "<差分包目录>" --dry   # 先预览
 #   python apply_ldiff.py --gamedir "<客户端根目录>" --pack "<差分包目录>"         # 正式应用
-import json, sys, hashlib, time, argparse, pathlib
+import json, sys, hashlib, time, argparse, pathlib, shutil
 from concurrent.futures import ThreadPoolExecutor
 
 __version__ = "1.0"
@@ -158,6 +158,7 @@ def main():
     # ---- 第一遍: 校验每个文件的当前状态 ----
     print("\n正在校验本地文件 (读盘, 文件多时会慢) ...")
     todo, already, missing, corrupt = [], [], [], []
+    new_files = man.get("new_files") or []      # 整份打包的新增文件(本地没有, 无补丁可用)
     lock = [0]
 
     def check(rec):
@@ -193,14 +194,49 @@ def main():
     if corrupt:
         print(f"  [提示] {len(corrupt)} 个文件源内容不符, 打不了补丁, 需要全量更新")
 
+    if new_files:
+        print(f"  另有整份打包的新增文件 {len(new_files)} 个 (本地没有, 无补丁可用, 直接复制)")
+
     if a.dry:
         for rec in todo[:20]:
             print(f"    将更新: {rec['filename']}")
         if len(todo) > 20:
             print(f"    ... 另有 {len(todo)-20} 个")
+        for rec in new_files[:20]:
+            print(f"    将新增: {rec['filename']}")
+        if len(new_files) > 20:
+            print(f"    ... 另有 {len(new_files)-20} 个新增文件")
         print(f"\n(--dry 预览: 未写任何文件)")
         wait_exit()
         return
+
+    # ---- 新增文件: 整份复制到客户端 ----
+    n_copied = n_new_skip = 0
+    new_bad = []
+    if new_files:
+        fdir = pack / man.get("files_dir", "files")
+        print(f"\n开始复制新增文件 (共 {len(new_files)} 个) ...")
+        for i, rec in enumerate(new_files, 1):
+            srcf = safe_rel(fdir, rec["filename"])
+            dst = safe_rel(gamedir, rec["filename"])
+            try:
+                if not srcf.is_file():
+                    new_bad.append((rec["filename"], "包内缺少该文件")); continue
+                if srcf.stat().st_size != rec["size"] or md5_file(srcf) != rec["md5"]:
+                    new_bad.append((rec["filename"], "包内文件校验不通过")); continue
+                if dst.is_file() and dst.stat().st_size == rec["size"] and md5_file(dst) == rec["md5"]:
+                    n_new_skip += 1; continue          # 已经装过了(重跑)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(srcf, dst)
+                n_copied += 1
+            except Exception as e:
+                new_bad.append((rec["filename"], f"{type(e).__name__}: {e}"))
+            if i % 50 == 0 or i == len(new_files):
+                print(f"[{time.strftime('%H:%M:%S')}] 新增 {i} / {len(new_files)} · {rec['filename']}")
+        print(f"新增文件完成: 复制 {n_copied}, 已存在跳过 {n_new_skip}, 失败 {len(new_bad)}")
+    elif missing:
+        print(f"\n[提示] 有 {len(missing)} 个新增文件不在本包里。官方没有为不存在的文件生成补丁,")
+        print(f"       这些需要从官方 CDN 全量下载(见文末清单)。")
 
     # ---- 第二遍: 逐个应用补丁 ----
     print(f"\n开始应用补丁 (共 {len(todo)} 个文件) ...")
@@ -239,11 +275,12 @@ def main():
                 p.unlink(); n += 1
         print(f"已删除官方标记的旧文件: {n} / {len(deletes)}")
 
-    if fail == 0 and not missing and not corrupt:
+    if fail == 0 and not missing and not corrupt and not new_bad:
         set_config_version(gamedir, tgt)
         print(f"\n完成: 客户端已更新到 {tgt}")
     else:
-        print(f"\n部分文件未能更新 (失败 {fail}, 缺失 {len(missing)}, 源异常 {len(corrupt)})。")
+        print(f"\n部分文件未能更新 (补丁失败 {fail}, 缺失 {len(missing)}, 源异常 {len(corrupt)}, "
+              f"新增失败 {len(new_bad)})。")
         print(f"config.ini 未改动。这些文件请用全量更新补齐:")
         for rec in missing[:50]:
             print(f"  缺失 {rec['filename']}")
@@ -251,6 +288,8 @@ def main():
             print(f"  异常 {rec['filename']}  ({why})")
         for fn, why in failed[:50]:
             print(f"  失败 {fn}  ({why})")
+        for fn, why in new_bad[:50]:
+            print(f"  新增失败 {fn}  ({why})")
     wait_exit()
 
 if __name__ == "__main__":
