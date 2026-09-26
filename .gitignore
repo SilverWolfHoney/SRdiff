@@ -10,6 +10,7 @@ sophon_update_cache/
 # 打包产物（用 build_exe.py 生成，不入库）
 build/
 dist/
+*.spec
 
 # 编辑器 / 系统
 .vscode/
