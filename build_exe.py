@@ -31,6 +31,17 @@ def main():
     for d in ("build", "dist"):
         shutil.rmtree(HERE / d, ignore_errors=True)
 
+    # exe 正在运行(或被杀软扫描)时 Windows 不允许覆盖, 提前给个清楚的提示而不是丢 traceback
+    old_exe = HERE / "dist" / (EXE_NAME + ".exe")
+    if old_exe.exists():
+        try:
+            old_exe.unlink()
+        except PermissionError:
+            print(f"无法覆盖 {old_exe}\n"
+                  f"  它可能正在运行, 或被杀毒软件占用。\n"
+                  f"  请关掉它(必要时结束 {EXE_NAME}.exe 进程)后重试。")
+            sys.exit(1)
+
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--onefile", "--console", "--clean", "--noconfirm",
