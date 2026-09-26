@@ -212,8 +212,11 @@ def collect(cat, src, dry, outdir, workers, limit=0, src_man=None, tgt_dl=None,
     print(f"  无需处理(目标版本未改动) {skipped_unchanged} 个")
     print(f"  补丁池 {len(pools)} 个, 补丁段需下载 {human(dl_bytes)}, 应用后产出 {human(new_bytes)}")
     if n_added:
-        print(f"  [注意] 另有 {n_added} 个文件是你本地没有、官方也没给补丁的(新增),")
-        print(f"         共 {human(added_dl)}: 差分包覆盖不了, 必须全量下载")
+        print(f"  [注意] 另有 {n_added} 个文件是你本地没有、官方也没给补丁的(新增), 共 {human(added_dl)}")
+        if with_new:
+            print(f"         这些没有补丁可用, 将整份下载打包进 files\\ (对方即可离线升级)")
+        else:
+            print(f"         差分包覆盖不了, 只能全量下载(--no-new 未打包)")
 
     if dry:
         return {"files": len(picked), "pools": len(pools), "dl": dl_bytes, "new": new_bytes,
@@ -399,9 +402,10 @@ def main():
     ap.add_argument("--dry", action="store_true", help="只统计体积, 不下载不写文件")
     ap.add_argument("--limit", type=int, default=0,
                     help="每类最多取多少个补丁池(0=不限); 用于小规模试跑, 会导出不完整的包")
-    ap.add_argument("--with-new", action="store_true", dest="with_new",
-                    help="把新增文件(官方没有补丁)也整份下载打包, 让对方一个包就能离线完成升级; "
-                         "会让导出目录大很多(可自行压缩后再分享)")
+    ap.add_argument("--new", action="store_true", dest="with_new", default=True,
+                    help="(默认开启) 把新增文件也整份下载打包进 files\\, 对方一个包就能离线完成升级")
+    ap.add_argument("--no-new", action="store_false", dest="with_new",
+                    help="不打包新增文件, 只导出补丁段(体积小, 但对方还得自己从官方补全新增文件)")
     a = ap.parse_args()
 
     gamedir = pathlib.Path(a.gamedir)
@@ -494,15 +498,18 @@ def main():
           f"(本地需改动 {n_content_total}, 本地缺失可重建 {sum(s.get('n_rebuild', 0) for s in stats)})")
     print(f"  补丁段需下载: {human(dl_total)}   应用后产出: {human(new_total)}   耗时 {el:.0f}s")
     if added_dl_total:
-        if all_new_files:
-            print(f"  新增文件 {len(all_new_files)} 个已一并打包(整份内容): {human(bund_total)}")
+        if a.with_new:
+            if a.dry:
+                print(f"  新增文件 {n_added_total} 个将一并打包(整份内容, 预览未下载): {human(added_dl_total)}")
+                print(f"  => 完整包预计 {human(dl_total + added_dl_total)} (未压缩)")
+            else:
+                print(f"  新增文件 {len(all_new_files)} 个已一并打包(整份内容): {human(bund_total)}")
+                print(f"  => 本包合计 {human(dl_total + bund_total)} (未压缩)")
+                print(f"     对方只需本包 + 应用工具即可完成 {src} -> {tgt}, 不用再访问官方。")
         else:
-            print(f"  另有新增文件 {n_added_total} 个(官方无补丁): {human(added_dl_total)} —— 未打包,"
-                  f" 对方仍需从官方全量下载")
-            print(f"         想连它们一起打包, 加 --with-new 重跑(导出目录会更大)")
-    total_dl = dl_total + (bund_total if all_new_files else added_dl_total)
-    print(f"  => 对方拿到这个包后真实下载量 ≈ {human(total_dl)}"
-          + ("" if all_new_files else f" (补丁 {human(dl_total)} + 新增 {human(added_dl_total)})"))
+            print(f"  另有新增文件 {n_added_total} 个(官方无补丁): {human(added_dl_total)} —— 未打包(--no-new)")
+            print(f"  => 对方还需要自己从官方下载这部分; 本包 + 官方下载 ≈ {human(dl_total + added_dl_total)}")
+            print(f"     想要一个能离线升级的完整包, 去掉 --no-new 重跑(补丁池已下载, 会跳过)")
 
     if a.dry:
         print("\n(--dry 预览: 未下载、未写文件)")
@@ -541,17 +548,17 @@ def main():
 
     _add_line = ""
     if all_new_files:
-        _add_line = (f"      另有新增文件 {len(all_new_files)} 个, 已整份打包在 files\\ 目录: {human(bund_total)}。\n"
-                     f"      应用脚本会自动把它们复制到客户端。\n")
+        _add_line = (f"      新增文件 {len(all_new_files)} 个(官方没有补丁的那种), 已整份下载在 files\\ 目录。\n"
+                     f"      应用脚本会自动把它们复制到客户端。对方只需本包 + 应用工具, 不用再访问官方。\n")
     elif added_dl_total:
-        _add_line = (f"      注意: 新增文件 {n_added_total} 个({human(added_dl_total)})不在本包里 ——\n"
-                     f"      官方没有为不存在的文件生成补丁, 它们需要从官方 CDN 全量下载(见文末说明)。\n")
+        _add_line = (f"      注意: 新增文件 {n_added_total} 个({human(added_dl_total)})没有打进本包。\n"
+                     f"      官方不为本地不存在的文件生成补丁, 所以它们只能从官方 CDN 全量下载。\n")
     _total_dl = dl_total + (bund_total if all_new_files else added_dl_total)
     (outdir / "如何应用.txt").write_text(
         f"""SRdiff 差分包  {src} -> {tgt}
 =====================================
-内容: 官方补丁 {len(all_records)} 个文件, 补丁段 {human(dl_total)} (在 pool\\ 目录)。
-{_add_line}      本次 {src} -> {tgt} 真实下载量 ≈ {human(_total_dl)}。
+内容: 补丁段 {len(all_records)} 个文件 / {human(dl_total)}    (pool\\ 目录)
+{_add_line}      本包合计 {human(_total_dl)}(未压缩)。
 
 要求: 你的客户端必须是 {src} 版本(未改动过)。补丁按原文件内容生成,
       源文件被改过就会打不上(应用脚本会报出来, 那个文件需要单独全量更新)。
