@@ -234,9 +234,9 @@ def main():
             if i % 50 == 0 or i == len(new_files):
                 print(f"[{time.strftime('%H:%M:%S')}] 新增 {i} / {len(new_files)} · {rec['filename']}")
         print(f"新增文件完成: 复制 {n_copied}, 已存在跳过 {n_new_skip}, 失败 {len(new_bad)}")
-    elif missing:
-        print(f"\n[提示] 有 {len(missing)} 个新增文件不在本包里。官方没有为不存在的文件生成补丁,")
-        print(f"       这些需要从官方 CDN 全量下载(见文末清单)。")
+    if missing:
+        print(f"\n[提示] 有 {len(missing)} 个文件本包覆盖不到(本地没有、官方也不为它们出补丁)。")
+        print(f"       补救: 用全量升级工具从官方补齐这些文件即可(差分包已经把其余文件省掉了)。")
 
     # ---- 第二遍: 逐个应用补丁 ----
     print(f"\n开始应用补丁 (共 {len(todo)} 个文件) ...")
@@ -282,6 +282,9 @@ def main():
         print(f"\n部分文件未能更新 (补丁失败 {fail}, 缺失 {len(missing)}, 源异常 {len(corrupt)}, "
               f"新增失败 {len(new_bad)})。")
         print(f"config.ini 未改动。这些文件请用全量更新补齐:")
+        print(f"   Python:      python sophon_update.py --gamedir \"<客户端根目录>\"")
+        print(f"   (只补这些文件, 其余文件差分包已经处理好了; 补完再跑一次本程序即可)")
+        print(f"未处理清单:")
         for rec in missing[:50]:
             print(f"  缺失 {rec['filename']}")
         for rec, why in corrupt[:50]:
