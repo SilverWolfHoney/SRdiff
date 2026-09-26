@@ -157,15 +157,21 @@ def main():
 
     # ---- 第一遍: 校验每个文件的当前状态 ----
     print("\n正在校验本地文件 (读盘, 文件多时会慢) ...")
-    todo, already, missing, corrupt = [], [], [], []
+    todo, already, missing, corrupt, from_new = [], [], [], [], []
     new_files = man.get("new_files") or []      # 整份打包的新增文件(本地没有, 无补丁可用)
+    newset = {r["filename"] for r in new_files}
     lock = [0]
 
     def check(rec):
         dst = safe_rel(gamedir, rec["filename"])
         if not dst.is_file():
-            # 源文件本就不存在(官方标记 original_md5 为空且源大小 0): 补丁自带全部内容, 可直接重建
-            if not rec["original_md5"] and rec["original_size"] == 0:
+            # 本地没有这个文件。三种情况:
+            #   a) 包内的新增文件已经整份带了内容 -> 由新增文件负责, 不算缺失
+            #   b) 补丁自带全部内容(original_md5 为空) -> 直接重建
+            #   c) 补丁需要源文件但本地没有     -> 真缺, 只能全量补
+            if rec["filename"] in newset:
+                from_new.append(rec)
+            elif not rec["original_md5"] and rec["original_size"] == 0:
                 todo.append(rec)
                 lock[0] += 1
             else:
@@ -175,6 +181,9 @@ def main():
         if size == rec["size"] and md5_file(dst) == rec["md5"]:
             already.append(rec); return              # 已经是目标版本
         if not rec["original_md5"]:
+            # 包内新增文件随后会整份覆盖它, 属于正常(旧版残留), 不算异常
+            if rec["filename"] in newset:
+                return
             corrupt.append((rec, f"该文件本应缺失, 但本地存在(大小 {size})")); return
         if size != rec["original_size"]:
             corrupt.append((rec, f"大小 {size} != 源大小 {rec['original_size']}")); return
@@ -188,9 +197,13 @@ def main():
     with ThreadPoolExecutor(max_workers=a.workers) as ex:
         list(ex.map(check, patches))
 
-    print(f"  待打补丁 {len(todo)} 个, 已是新版本 {len(already)} 个, 缺失 {len(missing)} 个, 源文件异常 {len(corrupt)} 个")
+    print(f"  待打补丁 {len(todo)} 个, 已是新版本 {len(already)} 个, "
+          f"由包内新增文件提供 {len(from_new)} 个, 缺失 {len(missing)} 个, 源文件异常 {len(corrupt)} 个")
+    if from_new:
+        print(f"  [提示] {len(from_new)} 个文件本地没有、官方补丁也要求源文件, "
+              f"但包内的新增文件已整份带了内容, 随后会直接复制到位")
     if missing:
-        print(f"  [提示] {len(missing)} 个文件本地缺失, 这些需要走全量更新(见文末清单)")
+        print(f"  [提示] {len(missing)} 个文件本包覆盖不到, 需要走全量更新(见文末清单)")
     if corrupt:
         print(f"  [提示] {len(corrupt)} 个文件源内容不符, 打不了补丁, 需要全量更新")
 

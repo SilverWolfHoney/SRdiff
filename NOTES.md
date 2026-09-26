@@ -76,4 +76,5 @@ POST https://api-takumi.mihoyo.com/downloader/sophon_chunk/api/getPatchBuild
 - 补丁池文件名为 `patch_id`（`<8字节hex>_<16字节hex>`），段位置由 `patch_offset`/`patch_length` 给出；实测每个池内的段都是**首尾相接、从 offset 0 开始**，导出时按 offset 摆放（空隙补零）即可保持偏移语义。
 - 语音类别 id：`10055` 中 / `10056` 英 / `10057` 日 / `10058` 韩。
 - 未写进 README 的调试参数：`sophon_ldiff.py --limit N` 每类只取前 N 个补丁池（小规模试跑，导出的是不完整的包）。
+- **官方补丁清单的一个怪现象**：少数「本地从来没有过」的文件也会被列进差分清单，且带 `original_hash`（即要求本地有源文件）。实测 4.5.0 → 4.6.0 有 1323 个这样的 `.block` 文件，它们的 `original_size` 与新大小只差几十字节，且同时出现在目标版本的 `new_files` 里。**应用端必须用 `new_files` 优先判定**：本地没有该文件时先看它是否由包内新增文件整份提供，否则会把 1323 个文件误报成「缺失、需要全量补」。
 - 程序按 `hkrpg_cn` **国服**写死（`GAME_ID` / `LAUNCHER_ID` / 语音类别 id）。其它区服或其它米哈游游戏需改这几个常量。
