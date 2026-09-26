@@ -178,12 +178,13 @@ def main():
                 missing.append(rec)
             return
         size = dst.stat().st_size
+        # 先判"是不是已经是目标版本": 官方清单里有些文件被标成"新增"(original_md5 为空),
+        # 但本地其实已经有了(内容一致) —— 常见于装过官方预下载的客户端, 这属于正常, 不该报异常。
         if size == rec["size"] and md5_file(dst) == rec["md5"]:
-            already.append(rec); return              # 已经是目标版本
+            already.append(rec); return
+        if rec["filename"] in newset:
+            return                                   # 包内新增文件随后会整份覆盖/补齐
         if not rec["original_md5"]:
-            # 包内新增文件随后会整份覆盖它, 属于正常(旧版残留), 不算异常
-            if rec["filename"] in newset:
-                return
             corrupt.append((rec, f"该文件本应缺失, 但本地存在(大小 {size})")); return
         if size != rec["original_size"]:
             corrupt.append((rec, f"大小 {size} != 源大小 {rec['original_size']}")); return
