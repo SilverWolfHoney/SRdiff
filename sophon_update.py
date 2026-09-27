@@ -144,7 +144,7 @@ def get_build(br):
     return http("https://api-takumi.mihoyo.com/downloader/sophon_chunk/api/getBuild"
                 + f"?branch={br['branch']}&package_id={br['package_id']}&password={br['password']}")
 
-def process_category(cat, gamedir, dry, br=None, src_tag=None, index_cache=None):
+def process_category(cat, gamedir, dry, br=None, src_tag=None, index_cache=None, verify=False):
     cid = cat["category_id"]
     cname = cat.get("category_name", cid)
     chunk_prefix = cat["chunk_download"]["url_prefix"]
@@ -175,7 +175,9 @@ def process_category(cat, gamedir, dry, br=None, src_tag=None, index_cache=None)
             if old == fi.md5.lower():
                 n_skip += 1; n_indexed += 1; continue    # 与本地版本清单一致 => 本就是新版, 不读盘
         elif dst.stat().st_size == fi.size:
-            if dry:                               # dry 且无清单基准时只按大小估算
+            # --dry 默认只按大小估算(不读盘); 但加了 --verify 就必须真算 md5,
+            # 否则"大小恰好相同、内容却是旧版"的文件会被误判为已是最新。
+            if dry and not verify:
                 n_skip += 1; continue
             try:
                 if hashlib.md5(dst.read_bytes()).hexdigest().lower() == fi.md5.lower():
@@ -185,7 +187,7 @@ def process_category(cat, gamedir, dry, br=None, src_tag=None, index_cache=None)
         if fi.chunks:
             need.append(fi)
             dl_bytes += sum(c.compressed_size for c in fi.chunks)   # 实际要下载的压缩体积
-        if not use_index and not dry and i % 2000 == 0:   # 校验本地要读完整包, 给个进度免得像卡住
+        if not use_index and (not dry or verify) and i % 2000 == 0:  # 校验本地要读完整包, 给个进度免得像卡住
             print(f"    统计中 {i}/{total_files} ... 需更新 {len(need)}")
     total_to_assemble = len(need)
     write_bytes = sum(f.size for f in need)                          # 解压后写入体积
@@ -307,11 +309,19 @@ def main():
     # ---- 清单比对基准: 本地版本 == 官方某分支 tag 时, 用清单 md5 判断, 不读本地文件 ----
     src_tag = None
     lv = local_version(gamedir)
+    # 防降级: 本地版本比目标版本还新时, 继续用这个目标会把客户端升回旧版
+    if lv and ver_key(lv) > ver_key(br["tag"]):
+        print(f"  [警告] 本地版本 {lv} 比目标版本 {br['tag']} 还新!")
+        print(f"         继续会把你降级到 {br['tag']}。要升到更新的版本, 请加 --branch predownload")
+        if br["tag"] != "pre_download":
+            other = gb.get("pre_download")
+            if other and ver_key(other.get("tag", "0")) > ver_key(br["tag"]):
+                print(f"         (官方 pre_download 分支当前是 {other['tag']})")
     if a.verify:
         print("  --verify: 强制逐文件 md5 校验 (会读整个客户端, 较慢)")
     elif lv:
         if ver_key(lv) == ver_key(br["tag"]):
-            print(f"  本地已是目标版本 {lv} (仍会按清单核对缺失/损坏文件)")
+            print(f"  本地已是目标版本 {lv}: 按清单核对缺失文件(不校验内容, 要逐文件校验内容请加 --verify)")
         elif branch_by_tag(gb, lv):
             src_tag = lv
             print(f"  已读本地版本 {lv}: 用官方 {lv} 清单作比对基准, 不读本地包")
@@ -323,7 +333,7 @@ def main():
     index_cache = {} if src_tag else None
     start_all = time.time()
     for cat in cats:
-        n, b = process_category(cat, gamedir, a.dry, br, src_tag, index_cache)
+        n, b = process_category(cat, gamedir, a.dry, br, src_tag, index_cache, a.verify)
         total += n; dl_total += b
     el_all = time.time() - start_all
     print(f"\n== 全部完成 == 共处理类别 {len(cats)} 个, 新增/重组文件合计: {total} 个, 需下载 {dl_total/2**30:.2f} GiB, 目标版本 {br['tag']}, 总耗时 {el_all:.0f}s ({el_all/60:.1f} 分钟)")
