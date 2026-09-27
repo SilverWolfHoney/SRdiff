@@ -81,6 +81,9 @@ python voice_pack.py --gamedir "<客户端根目录>" --lang cn,jp --branch pred
 | `--branch predownload` | 用官方**预下载**版本；默认 `main` = 已上线版本 |
 | `--dry` | 只统计体积，不下载不写文件 |
 | `--verify` | 强制逐文件 md5 校验（慢，会读整个客户端） |
+| `--force` | 跳过客户端根目录结构校验（确认目标目录特殊时才用） |
+
+> **根目录必须填「含 `StarRail_Data\` 的那个文件夹」本身。** 填错本身不危险，但会被当场拦下：工具会从你给的路径**一路向上扫到盘符根**（拖进来的往往是深层子目录，如 `...\AudioPackage\Windows\Chinese(PRC)`）、再向下扫几层，找出真正含 `StarRail_Data` 的目录，并**核对它下面的官方结构**（`StarRail_Data/Persistent/Audio`）确认真伪，然后建议你改用——交互模式可一键接受，命令行模式直接报错并给出应填的路径（找不到候选就只报错、绝不乱猜；`--force` 可跳过这套检查）。
 
 > **新版本开服前请务必带上 `--branch predownload`**：米哈游的新版本在开服前只存在于 `pre_download` 分支，而 `main` 还停在旧版本。少了这个参数，你以为在"补资源"，实际会把客户端升回旧版（工具检测到本地版本比目标新时会警告）。
 

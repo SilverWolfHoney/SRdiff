@@ -6,13 +6,129 @@
 import json, sys, hashlib, time, argparse, urllib.request, pathlib, shutil, os, zstandard
 from concurrent.futures import ThreadPoolExecutor
 
-__version__ = "1.1"
+__version__ = "1.3"
 
 B = "https://hyp-api.mihoyo.com/hyp/hyp-connect/api"
 LAUNCHER_ID = "jGHBHlcOq1"
 GAME_ID = "64kMb5iAWu"   # hkrpg_cn
 WORKERS = 12
 DL_RETRIES = 6
+
+# 客户端根目录下必然存在的顶层目录: 官方清单里每个文件的路径都以它开头
+CLIENT_ROOT_MARK = "StarRail_Data"
+
+# ---------------- 控制台配色 ----------------
+# 只在真终端里上色: 重定向到文件/管道时全部退化成纯文本, 日志里不会混进转义码。
+# Windows 控制台默认不解析 ANSI, 这里顺手打开 VT 处理; 打不开就自动变成无色。
+
+def _color_ok():
+    try:
+        if not sys.stdout or not sys.stdout.isatty():
+            return False
+    except Exception:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            k = ctypes.windll.kernel32
+            h = k.GetStdHandle(-11)                     # STD_OUTPUT_HANDLE
+            mode = ctypes.c_uint32()
+            if not k.GetConsoleMode(h, ctypes.byref(mode)):
+                return False
+            return bool(k.SetConsoleMode(h, mode.value | 0x0004))   # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        except Exception:
+            return False
+    return True
+
+
+_ON = _color_ok()
+
+
+def _paint(text, code):
+    return f"\033[{code}m{text}\033[0m" if _ON else str(text)
+
+
+def dim(t):    return _paint(t, "2")     # 次要信息 / 过程提示
+def bold(t):   return _paint(t, "1")     # 关键数字
+def red(t):    return _paint(t, "31")    # 错误 / 中止
+def green(t):  return _paint(t, "32")    # 成功 / 完成
+def yellow(t): return _paint(t, "33")    # 警告
+def cyan(t):   return _paint(t, "36")    # 标题 / 强调
+
+
+class ClientRootError(Exception):
+    """gamedir 明显不是客户端根目录。继续跑只会把文件全写到游戏读不到的位置, 所以直接中止。"""
+
+
+def is_client_root(p):
+    """p 是不是客户端根目录。判据是它下面有 StarRail_Data 目录 —— 这是硬特征。
+
+    刻意不用 config.ini / StarRail.exe 之类当判据: 米哈游启动器目录、甚至盘符根
+    都可能带 config.ini(实测 E:\\ 和 E:\\miHoYo Launcher 都有), 拿它们判断会把
+    上一级误认成根目录。"""
+    try:
+        return (p / CLIENT_ROOT_MARK).is_dir()
+    except OSError:
+        return False
+
+
+def find_client_root(gamedir, max_down=3):
+    """在 gamedir 附近定位真正的客户端根目录, 用于"路径填错"时给出正确建议。
+
+    输错的路径一定落在客户端内部或紧邻处(拖进资源管理器的往往是很深的子目录),
+    所以先**一路向上扫到盘符根** —— 每层只做一次目录判断, 快到可以忽略, 因此刻意
+    不设层数上限, 免得深层输入(如 ...\\AudioPackage\\Windows)超出范围扫不到;
+    再向下逐层扫几层(应对把启动器目录当根目录的情况)。
+
+    判据是硬事实: 该目录下真的有 StarRail_Data —— 不是靠目录名猜。"""
+    p = gamedir.parent
+    while p != p.parent:                   # 一直扫到盘符根
+        if is_client_root(p):
+            return [p]                    # 越近的祖先越可能是根目录
+        p = p.parent
+    level = [gamedir]
+    for _ in range(max_down):
+        nxt, found = [], []
+        for d in level:
+            try:
+                subs = sorted(c for c in d.iterdir() if c.is_dir())
+            except OSError:
+                continue                   # 没权限/路径异常, 跳过这一支
+            for c in subs:
+                (found if is_client_root(c) else nxt).append(c)
+        if found:
+            return found                   # 同层有多个候选就都交出去, 不自作主张挑一个
+        if len(nxt) > 200:                 # 目录太杂(比如填到了盘符根), 不再乱翻
+            return []
+        level = nxt
+    return []
+
+
+def client_root_problem(gamedir, cands):
+    """生成"这不是客户端根目录"的说明文字; cands 非空时附上建议路径。"""
+    lines = [f"{gamedir} 下面没有 {CLIENT_ROOT_MARK} 目录, 因此它不是客户端根目录。"]
+    if len(cands) == 1:
+        lines.append(f"附近找到的客户端根目录: {cands[0]}")
+    elif cands:
+        lines.append("附近找到多个可能的客户端根目录, 请直接指定其中一个:")
+        lines += [f"  - {c}" for c in cands[:5]]
+    return "\n".join(lines)
+
+
+def check_manifest_roots(man, gamedir):
+    """清单里的路径都相对客户端根目录(形如 StarRail_Data/...)。
+    返回"不满足这个结构"的原因列表; 空列表 = 结构正确, 可以安全组装。
+
+    注意只认必备目录是否到位: 其它顶层目录缺失正是"本来就该下载"的正常状态
+    (精简客户端的语音/资源目录常常整个不存在), 拿它们判错会误伤正常用法。"""
+    for f in man.files:
+        parts = pathlib.PurePosixPath(f.filename).parts if f.filename else ()
+        if parts and (parts[0] in (".", "..") or parts[0].endswith(":")):
+            return [f"清单里出现异常路径 {parts[0]}/"]
+    if not (gamedir / CLIENT_ROOT_MARK).is_dir():
+        return [CLIENT_ROOT_MARK]
+    return []
+
 
 def http(url, post=None):
     data = json.dumps(post).encode() if post is not None else None
@@ -144,14 +260,24 @@ def get_build(br):
     return http("https://api-takumi.mihoyo.com/downloader/sophon_chunk/api/getBuild"
                 + f"?branch={br['branch']}&package_id={br['package_id']}&password={br['password']}")
 
-def process_category(cat, gamedir, dry, br=None, src_tag=None, index_cache=None, verify=False):
+def process_category(cat, gamedir, dry, br=None, src_tag=None, index_cache=None, verify=False, force=False):
     cid = cat["category_id"]
     cname = cat.get("category_name", cid)
     chunk_prefix = cat["chunk_download"]["url_prefix"]
-    print(f"\n=== [{cid}] {cname} ===")
+    print(f"\n{cyan('■')} {bold(cname)} {dim('· ' + cid)}")
     man = load_manifest(cat["manifest"], cat["manifest_download"]["url_prefix"])
     total_files = len(man.files)
-    print(f"  清单文件数: {total_files}  (并发下载: {WORKERS} 线程)")
+    # ---- 结构校验(确凿版): 清单里的路径都相对客户端根目录, 若顶层目录在 gamedir 下
+    #      根本不存在, 那这次组装没有一个文件会落到游戏能读到的位置。此时无论预览
+    #      还是真下载都必须停下: 预览会谎报"要下 11 GiB", 真下载则纯属白下白写。
+    if not force:
+        missing = check_manifest_roots(man, gamedir)
+        if missing:
+            raise ClientRootError(
+                f"目标不是客户端根目录: {gamedir} 下缺少 {', '.join(missing)}\n"
+                f"         清单里每个文件的路径都相对客户端根目录(以 {CLIENT_ROOT_MARK}/ 开头),\n"
+                f"         在这里组装会把文件全部写到游戏读不到的位置。\n"
+                f"         (确认目标目录特殊、坚持要写, 可加 --force 跳过这个检查)")
     # ---- 第一遍: 统计需要组装的(缺失或内容不符), 拿到"总共需组装" ----
     idx = index_cache.get(cid) if index_cache is not None else None
     if idx is None and src_tag and index_cache is not None:
@@ -159,9 +285,9 @@ def process_category(cat, gamedir, dry, br=None, src_tag=None, index_cache=None,
         index_cache[cid] = idx
     use_index = bool(idx)
     if use_index:
-        print(f"  正在比对清单 (本地 {src_tag} 的官方清单 vs 目标) ...")
+        print(f"  {dim(f'比对 {src_tag} 清单中 ...')}")
     else:
-        print("  正在统计需要更新的文件 (逐文件校验, 会读整个客户端) ...")
+        print(f"  {dim('逐文件核对中 (要读整个客户端) ...')}")
     need = []
     n_skip = 0
     n_indexed = 0
@@ -188,23 +314,26 @@ def process_category(cat, gamedir, dry, br=None, src_tag=None, index_cache=None,
             need.append(fi)
             dl_bytes += sum(c.compressed_size for c in fi.chunks)   # 实际要下载的压缩体积
         if not use_index and (not dry or verify) and i % 2000 == 0:  # 校验本地要读完整包, 给个进度免得像卡住
-            print(f"    统计中 {i}/{total_files} ... 需更新 {len(need)}")
+            print(f"    {dim(f'统计中 {i}/{total_files} · 需更新 {len(need)}')}")
     total_to_assemble = len(need)
     write_bytes = sum(f.size for f in need)                          # 解压后写入体积
-    if use_index:
-        print(f"  清单比对: {n_indexed} 个文件与本地版本一致 (未读盘)")
-    print(f"  总共需要组装: {total_to_assemble}  (已正确跳过 {n_skip})")
-    print(f"  需下载 {dl_bytes/2**30:.2f} GiB (压缩)  →  写入磁盘 {write_bytes/2**30:.2f} GiB")
+    print(f"  {dim('文件')} {total_files}   {dim('已跳过')} {n_skip}   "
+          f"{dim('需组装')} {bold(total_to_assemble)}")
+    if total_to_assemble:
+        print(f"  {dim('需下载')} {bold(f'{dl_bytes/2**30:.2f} GiB')} "
+              f"{dim(f'(压缩) → 写入磁盘 {write_bytes/2**30:.2f} GiB')}")
+    else:
+        print(f"  {green('已是最新, 无需下载')}")
     if dry:
-        print(f"  [dry] 将组装 {total_to_assemble} 个 (未下载未写文件)")
         return total_to_assemble, dl_bytes
     # ---- 磁盘空间预检: 装不下就别白下 ----
     try:
         free = shutil.disk_usage(gamedir.absolute()).free
         if free < write_bytes:
-            print(f"  [警告] 目标盘剩余 {free/2**30:.2f} GiB, 不足需写入的 {write_bytes/2**30:.2f} GiB, 可能中途写失败!")
+            print(f"  {yellow('[!] 磁盘不足')} 剩余 {free/2**30:.2f} GiB < "
+                  f"需写入 {write_bytes/2**30:.2f} GiB, 可能中途写失败")
         else:
-            print(f"  磁盘预检: 剩余 {free/2**30:.2f} GiB, 足够写入 {write_bytes/2**30:.2f} GiB")
+            print(f"  {dim(f'磁盘剩余 {free/2**30:.2f} GiB, 足够')}")
     except Exception:
         pass
     # ---- 第二遍: 逐文件组装下载 ----
@@ -221,20 +350,30 @@ def process_category(cat, gamedir, dry, br=None, src_tag=None, index_cache=None,
             for offset, data in results:
                 buf[offset:offset+len(data)] = data
             if hashlib.md5(buf).hexdigest().lower() != fi.md5.lower():
-                print(f"  [WARN] md5 校验失败: {rel}"); continue
+                print(f"  {red('md5 校验失败')} {rel}"); continue
             dst.parent.mkdir(parents=True, exist_ok=True)
             with open(dst, "wb") as fh: fh.write(buf)
             n_new += 1
-            print(f"[{time.strftime('%H:%M:%S')}] 已组装 {n_new} / {total_to_assemble}  · {rel}")
+            # 真终端里同一行刷新进度(几百个文件也不会刷屏); 重定向时每 50 个报一次
+            if _ON:
+                short = rel if len(rel) <= 56 else "..." + rel[-53:]
+                sys.stdout.write(f"\r  {dim(f'组装 {n_new}/{total_to_assemble}')}  {short:<56}")
+                sys.stdout.flush()
+            elif n_new % 50 == 0 or n_new == total_to_assemble:
+                print(f"  组装 {n_new}/{total_to_assemble}")
     el = time.time() - t0
-    print(f"  [{cid}] 完成: 已组装 {n_new}/{total_to_assemble}  已正确跳过 {n_skip}  耗时 {el:.0f}s")
+    if _ON and need:
+        print()                                   # 收尾: 从同行进度换到新行
+    done = green(f"{n_new}/{total_to_assemble}") if n_new == total_to_assemble \
+        else yellow(f"! {n_new}/{total_to_assemble}")
+    print(f"  {done} {dim(f'· 跳过 {n_skip} · 耗时 {el:.0f}s')}")
     return n_new, dl_bytes
 
 def set_config_version(gamedir, tag):
     # 更新 config.ini 的 game_version 为目标版本, 让启动器显示正确版本
     cfg = gamedir / "config.ini"
     if not cfg.is_file():
-        print("  (未找到 config.ini, 跳过版本标记)")
+        print(f"  {dim('(未找到 config.ini, 跳过版本标记)')}")
         return
     lines = cfg.read_bytes().decode("utf-8", errors="ignore").splitlines(keepends=True)
     found = False
@@ -245,7 +384,7 @@ def set_config_version(gamedir, tag):
             break
     if found:
         cfg.write_bytes("".join(lines).encode("utf-8"))
-        print(f"  [config] game_version -> {tag}")
+        print(f"  {dim('config.ini')} game_version -> {bold(tag)}")
 
 def ask_clean_cache():
     # 交互: 问用户是否清理缓存目录; 用户说删就删(默认不删)
@@ -262,7 +401,7 @@ def ask_clean_cache():
         for f in files:
             try: f.unlink()
             except Exception: pass
-        print("  缓存已清理。")
+        print(f"  {dim('缓存已清理。')}")
 
 def ask_path(prompt):
     """交互式问路径; 支持把文件夹从资源管理器拖进控制台(会自动带引号)"""
@@ -282,6 +421,29 @@ def ask_path(prompt):
         print(f"  提示: 可以直接把客户端文件夹从资源管理器拖进这个窗口。")
 
 
+def ask_client_root(prompt, force=False):
+    """反复问客户端根目录, 直到拿到一个真的含 StarRail_Data 的目录为止。
+    填深/填浅时直接把旁边正确的位置指出来, 并允许一键改用 —— 这在问任何业务问题
+    和联网之前就完成, 不会让用户白答一堆问题才发现路径不对。
+    force=True 时退化成普通 ask_path(只要求目录存在)。"""
+    while True:
+        p = ask_path(prompt)
+        if p is None or force:
+            return p
+        if is_client_root(p):
+            return p
+        cands = find_client_root(p)
+        print(f"  [提示] {client_root_problem(p, cands)}")
+        if len(cands) == 1:
+            try:
+                ans = input(f"  改用 {cands[0]} 吗? [Y/n]: ").strip().lower()
+            except EOFError:
+                ans = ""              # 无人应答时取默认(Y): 这个路径是硬事实推出来的
+            if ans in ("", "y", "yes"):
+                return cands[0]
+        print("  请重新输入客户端根目录。")
+
+
 def ask_menu(title, options, default=1):
     """给一个编号菜单; options 是 [(显示名, 值), ...]; 返回选中的值"""
     print(f"\n{title}")
@@ -299,19 +461,19 @@ def ask_menu(title, options, default=1):
         print(f"  请输入 1-{len(options)} 之间的数字")
 
 
-def _interactive_setup():
+def _interactive_setup(force=False):
     """无参数运行时走这里: 一步步问清楚要做什么, 返回一个简单的配置对象"""
-    print("=" * 58)
-    print("  SRdiff — 星穹铁道(国服) 客户端升级")
-    print("=" * 58)
+    print(f"\n{bold(cyan('SRdiff'))} {dim('·')} 星穹铁道(国服) 客户端升级")
+    print(dim("-" * 52))
 
-    gamedir = ask_path("\n客户端根目录 (含 StarRail_Data 的那个文件夹): ")
+    gamedir = ask_client_root("\n客户端根目录 (含 StarRail_Data 的那个文件夹): ", force)
     if gamedir is None:
         return None
     lv = local_version(gamedir)
-    print(f"  当前版本: {lv if lv else '(读不到 config.ini 的版本号)'}    路径: {gamedir}")
+    print(f"  {dim('客户端')} {gamedir}")
+    print(f"  {dim('版本  ')} {lv if lv else dim('(读不到 config.ini)')}")
 
-    print("\n正在查询官方版本 ...")
+    print(f"\n  {dim('查询官方版本 ...')}")
     try:
         gb = load_branches()
     except Exception as e:
@@ -366,12 +528,14 @@ def main():
     ap.add_argument("--dry", action="store_true", help="只预览, 不下载不写文件")
     ap.add_argument("--verify", action="store_true",
                     help="强制逐文件 md5 校验(慢, 会读整个客户端); 默认走清单比对, 秒出结果")
+    ap.add_argument("--force", action="store_true",
+                    help="跳过客户端根目录结构校验(确认目标目录特殊时才用)")
     a = ap.parse_args()
 
     # 不带 --gamedir 就进入交互模式
     interactive = a.gamedir is None
     if interactive:
-        cfg = _interactive_setup()
+        cfg = _interactive_setup(a.force)
         if cfg is None:
             print("\n已取消。"); return
         a.gamedir = str(cfg["gamedir"])
@@ -387,6 +551,13 @@ def main():
     gamedir = pathlib.Path(a.gamedir)
     if not gamedir.is_dir():
         print("gamedir 不存在:", gamedir); sys.exit(1)
+    # 命令行是明确指令, 不做静默改写: 不是客户端根目录就报错, 并给出正确写法
+    if not a.force and not is_client_root(gamedir):
+        cands = find_client_root(gamedir)
+        print(f"[错误] {client_root_problem(gamedir, cands)}")
+        if cands:
+            print(f'       请改用: --gamedir "{cands[0]}"')
+        sys.exit(2)
 
     # 把参数折算成"要处理哪些类别"
     if a.cat:
@@ -402,7 +573,11 @@ def main():
         mylv = local_version(gamedir)
         a.dry = True
 
-    _do_update(gamedir, a.branch, cat_id, a.dry, a.verify, mylv)
+    try:
+        _do_update(gamedir, a.branch, cat_id, a.dry, a.verify, mylv, a.force)
+    except ClientRootError as e:
+        print(f"\n[中止] {e}")
+        sys.exit(2)
 
     # 交互模式且只是预览时, 问一句要不要接着真升级
     # (选了"只检查完整性"就不问: 那本来就不是升级)
@@ -413,14 +588,22 @@ def main():
     except EOFError:
         return
     if ans in ("y", "yes"):
-        _do_update(gamedir, a.branch, cat_id, False, a.verify)
+        try:
+            _do_update(gamedir, a.branch, cat_id, False, a.verify, None, a.force)
+        except ClientRootError as e:
+            print(f"\n[中止] {e}")
+            sys.exit(2)
     else:
         print("已取消。")
 
-def _do_update(gamedir, branch, cat_id, dry, verify, check_ver=None):
+def _do_update(gamedir, branch, cat_id, dry, verify, check_ver=None, force=False):
     """执行一次升级(或预览)。cat_id 为 None 表示全部类别, 否则是类别 id 列表。
     check_ver 非空时=只核对这个本地版本是否完整(不升级), 用它的官方清单当目标。"""
-    print("解析分支 ...")
+    # ---- 早期结构校验: 放在下清单/读本地之前, 路径不对时连清单都不用下 ----
+    if not force and not is_client_root(gamedir):
+        msg = client_root_problem(gamedir, find_client_root(gamedir))
+        msg += "\n         (确认目标目录特殊、坚持要写, 可加 --force 跳过这个检查)"
+        raise ClientRootError(msg)
     gb = load_branches()
     if check_ver:
         # 只检查模式: 目标就是本地版本本身, 不能拿 main 分支去核对(否则会误判要"升级")
@@ -437,12 +620,12 @@ def _do_update(gamedir, branch, cat_id, dry, verify, check_ver=None):
     if not check_ver and branch == "main" and other and other.get("tag") != br.get("tag") \
             and ver_key(other["tag"]) > ver_key(br["tag"]):
         # 只走默认分支时才提醒: 官方预下载里有更高版本, 想提前囤可以切过去
-        print(f"  (提示: 官方另有 pre_download 分支 tag={other['tag']} 更高; 想提前下载可加 --branch predownload)")
-    print(f"  目标版本: {br['tag']}   源(diff_tags): {br['diff_tags']}")
+        print(f"  {yellow('提示')} 官方预下载已是 {bold(other['tag'])}"
+              f"{dim('; 想提前囤可加 --branch predownload')}")
+    print(f"\n{cyan('目标')} {bold(br['tag'])} {dim('· ' + ' / '.join(br['diff_tags'] or []))}")
 
     bj = get_build(br)
     manifests = bj["data"]["manifests"]
-    print(f"  资源类别: {len(manifests)} 个")
 
     if cat_id:
         cats = [m for m in manifests if m["category_id"] in cat_id]
@@ -450,43 +633,43 @@ def _do_update(gamedir, branch, cat_id, dry, verify, check_ver=None):
         cats = manifests
     if not cats:
         print("找不到类别:", cat_id); return
-    if cat_id:
-        print(f"  仅处理: {', '.join(m.get('category_name', m['category_id']) for m in cats)}")
 
     # ---- 清单比对基准: 本地版本 == 官方某分支 tag 时, 用清单 md5 判断, 不读本地文件 ----
     src_tag = None
     lv = local_version(gamedir)
     # 防降级: 本地版本比目标版本还新时, 继续用这个目标会把客户端升回旧版
     if lv and ver_key(lv) > ver_key(br["tag"]):
-        print(f"  [警告] 本地版本 {lv} 比目标版本 {br['tag']} 还新!")
-        print(f"         继续会把你降级到 {br['tag']}。要升到更新的版本, 请加 --branch predownload")
-        other2 = gb.get("pre_download")
-        if other2 and ver_key(other2.get("tag", "0")) > ver_key(br["tag"]):
-            print(f"         (官方 pre_download 分支当前是 {other2['tag']})")
+        tgt_now = br["tag"]
+        print(f"  {yellow(f'[!] 本地 {lv} 比目标 {tgt_now} 还新')}")
+        print(f"  {yellow('    继续会降级')} {dim('· 要升到更新的版本请加 --branch predownload')}")
     if verify:
-        print("  --verify: 强制逐文件 md5 校验 (会读整个客户端, 较慢)")
+        print(f"  {dim('校验: 逐文件 md5 (较慢)')}")
     elif lv:
         if ver_key(lv) == ver_key(br["tag"]):
-            print(f"  本地已是目标版本 {lv}: 按清单核对缺失文件(不校验内容, 要逐文件校验内容请加 --verify)")
+            print(f"  {dim(f'本地已是 {lv}: 只核对缺失文件')}")
         elif branch_by_tag(gb, lv):
             src_tag = lv
-            print(f"  已读本地版本 {lv}: 用官方 {lv} 清单作比对基准, 不读本地包")
+            print(f"  {dim(f'比对基准: 官方 {lv} 清单 (不读本地包)')}")
         else:
-            print(f"  本地版本 {lv} 不在官方分支列表里, 退回逐文件校验")
+            print(f"  {dim(f'本地 {lv} 不在官方分支列表, 退回逐文件校验')}")
 
     total = 0
     dl_total = 0
     index_cache = {} if src_tag else None
     start_all = time.time()
     for cat in cats:
-        n, b = process_category(cat, gamedir, dry, br, src_tag, index_cache, verify)
+        n, b = process_category(cat, gamedir, dry, br, src_tag, index_cache, verify, force)
         total += n; dl_total += b
     el_all = time.time() - start_all
-    print(f"\n== 全部完成 == 共处理类别 {len(cats)} 个, 新增/重组文件合计: {total} 个, "
-          f"需下载 {dl_total/2**30:.2f} GiB, 目标版本 {br['tag']}, 总耗时 {el_all:.0f}s ({el_all/60:.1f} 分钟)")
+    tgt, el_txt = br["tag"], f"{el_all:.0f}s"
     if dry:
-        print("(预览: 未下载未写文件)")
+        print(f"\n{green('预览完成')} {dim(f'· 未下载未写文件 · 目标 {tgt} · 耗时 {el_txt}')}")
+        print(f"  {dim('需下载')} {bold(f'{dl_total/2**30:.2f} GiB')}   "
+              f"{dim('需组装')} {bold(total)}")
     else:
+        print(f"\n{green('全部完成')} · 组装 {bold(total)} 个 · 下载 "
+              f"{dl_total/2**30:.2f} GiB · 目标 {tgt} · 耗时 {el_txt} "
+              f"{dim(f'({el_all/60:.1f} 分钟)')}")
         set_config_version(gamedir, br["tag"])
         ask_clean_cache()
 
