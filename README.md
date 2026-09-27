@@ -18,7 +18,8 @@ Python 3.8+（开发环境为 3.14）。
 
 | 文件 | 用途 |
 |---|---|
-| `sophon_update.py` | 主程序（唯一入口） |
+| `sophon_update.py` | 主程序：升级客户端（可交互、也可命令行） |
+| `voice_pack.py` | 只补充语音包（交互运行；测试服/精简客户端常用） |
 | `manifest.proto` / `manifest_pb2.py` | Sophon 清单的 proto 定义与生成物（日常不用管） |
 | `manifest_ldiff.proto` / `_pb2.py` | 官方差分包清单定义（当前未使用，保留备用） |
 | `gen_pb2.py` | 改了 `.proto` 后才需要跑：重新生成 `*_pb2.py` |
@@ -49,7 +50,28 @@ python sophon_update.py --gamedir "<客户端根目录>"
 python sophon_update.py --gamedir "<客户端根目录>" --cn --branch predownload
 ```
 
-### 常用参数
+### 补充语音包（voice_pack.py）
+
+测试服、精简版客户端常常**不带语音包**，或者只有部分语言。这个工具直接从官方 CDN 把语音包拉下来写进去：
+
+```bash
+python voice_pack.py
+```
+
+它会先显示客户端现有的语音包状态，然后依次问：要补哪些语言（中/英/日/韩/全部）→ 取哪个版本（已上线 / 预下载）→ 先预览还是直接下载。
+
+也可以用命令行：
+
+```bash
+python voice_pack.py --gamedir "<客户端根目录>" --lang cn,jp --branch predownload --dry
+```
+
+- 语音包会写到客户端的 `StarRail_Data/Persistent/Audio/AudioPackage/Windows/<语言>/`，和官方布局一致，所以测试服客户端同样适用。
+- 单个语言约 **11.5～14 GiB**，四种全要约 52 GiB。工具会**先算给你看**再问你确认。
+- 它用**逐文件 md5 校验**：本地已有的语音文件会跳过，只补缺失或损坏的（可中断、重跑接着补）。
+  > 语音包这里刻意**不**用「按版本号做清单比对」——测试服/精简版的版本号常与正式服不同，万一恰好相同，就会被误判成"语音包已存在"而不去补。
+
+## 常用参数
 
 | 参数 | 说明 |
 |---|---|
