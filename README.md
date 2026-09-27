@@ -23,6 +23,7 @@ Python 3.8+（开发环境为 3.14）。
 | `manifest.proto` / `manifest_pb2.py` | Sophon 清单的 proto 定义与生成物（日常不用管） |
 | `manifest_ldiff.proto` / `_pb2.py` | 官方差分包清单定义（当前未使用，保留备用） |
 | `gen_pb2.py` | 改了 `.proto` 后才需要跑：重新生成 `*_pb2.py` |
+| `SRdiff_voice.spec` | PyInstaller 打包配置：`pyinstaller SRdiff_voice.spec` 生成单文件 `dist/SRdiff_voice.exe` |
 
 ## 用法
 
@@ -83,7 +84,7 @@ python voice_pack.py --gamedir "<客户端根目录>" --lang cn,jp --branch pred
 | `--verify` | 强制逐文件 md5 校验（慢，会读整个客户端） |
 | `--force` | 跳过客户端根目录结构校验（确认目标目录特殊时才用） |
 
-> **根目录必须填「含 `StarRail_Data\` 的那个文件夹」本身。** 填错本身不危险，但会被当场拦下：工具会从你给的路径**一路向上扫到盘符根**（拖进来的往往是深层子目录，如 `...\AudioPackage\Windows\Chinese(PRC)`）、再向下扫几层，找出真正含 `StarRail_Data` 的目录，并**核对它下面的官方结构**（`StarRail_Data/Persistent/Audio`）确认真伪，然后建议你改用——交互模式可一键接受，命令行模式直接报错并给出应填的路径（找不到候选就只报错、绝不乱猜；`--force` 可跳过这套检查）。
+> **根目录必须填「含 `StarRail_Data\` 的那个文件夹」本身。** 填错本身不危险，但会被当场拦下：工具会从你给的路径**一路向上扫到盘符根**（拖进来的往往是深层子目录，如 `...\AudioPackage\Windows\Chinese(PRC)`）、再向下扫几层，找出真正含 `StarRail_Data` 的目录并建议你改用——交互模式可一键接受，命令行模式直接报错并给出应填的路径（找不到候选就只报错、绝不乱猜；`--force` 可跳过这套检查）。
 
 > **新版本开服前请务必带上 `--branch predownload`**：米哈游的新版本在开服前只存在于 `pre_download` 分支，而 `main` 还停在旧版本。少了这个参数，你以为在"补资源"，实际会把客户端升回旧版（工具检测到本地版本比目标新时会警告）。
 
@@ -121,6 +122,7 @@ python voice_pack.py --gamedir "<客户端根目录>" --lang cn,jp --branch pred
 - 目标版本从官方接口实时读取，**同一工具可反复用于后续升级**（4.6→4.7、4.7→4.8…），开服自动生效，不用改代码。
 - 程序按 `hkrpg_cn` **国服**写死（`GAME_ID` / `LAUNCHER_ID` / 语音类别 id）。其它区服或其它米哈游游戏需改文件顶部这几个常量。
 - 下载走官方 CDN，速度取决于你的网络；某些地区可能需要代理。
+- 控制台回显在**真终端**下带配色（标题/关键数字/警告分色）；输出被重定向到文件或管道时自动退化为纯文本，不会混入 ANSI 转义码。
 
 ## 已知限制 / 技术债
 
