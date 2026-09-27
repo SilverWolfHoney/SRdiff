@@ -264,29 +264,161 @@ def ask_clean_cache():
             except Exception: pass
         print("  缓存已清理。")
 
+def ask_path(prompt):
+    """交互式问路径; 支持把文件夹从资源管理器拖进控制台(会自动带引号)"""
+    while True:
+        try:
+            s = input(prompt).strip()
+        except EOFError:
+            return None
+        s = s.strip().strip('"').strip("'").strip()      # 去掉拖拽产生的引号与空格
+        if not s:
+            print("  (不能为空)")
+            continue
+        p = pathlib.Path(s)
+        if p.is_dir():
+            return p
+        print(f"  目录不存在: {p}")
+        print(f"  提示: 可以直接把客户端文件夹从资源管理器拖进这个窗口。")
+
+
+def ask_menu(title, options, default=1):
+    """给一个编号菜单; options 是 [(显示名, 值), ...]; 返回选中的值"""
+    print(f"\n{title}")
+    for i, (label, _v) in enumerate(options, 1):
+        print(f"  {i}. {label}")
+    while True:
+        try:
+            raw = input(f"请选择 [1-{len(options)}] (默认 {default}): ").strip()
+        except EOFError:
+            return options[default - 1][1]
+        if not raw:
+            return options[default - 1][1]
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return options[int(raw) - 1][1]
+        print(f"  请输入 1-{len(options)} 之间的数字")
+
+
+def _interactive_setup():
+    """无参数运行时走这里: 一步步问清楚要做什么, 返回一个简单的配置对象"""
+    print("=" * 58)
+    print("  SRdiff — 星穹铁道(国服) 客户端升级")
+    print("=" * 58)
+
+    gamedir = ask_path("\n客户端根目录 (含 StarRail_Data 的那个文件夹): ")
+    if gamedir is None:
+        return None
+    lv = local_version(gamedir)
+    print(f"  当前版本: {lv if lv else '(读不到 config.ini 的版本号)'}    路径: {gamedir}")
+
+    print("\n正在查询官方版本 ...")
+    try:
+        gb = load_branches()
+    except Exception as e:
+        print(f"  查询失败: {e}"); return None
+    main_br, pre_br = gb.get("main"), gb.get("pre_download")
+    if not main_br:
+        print("  官方没有返回 main 分支, 无法继续"); return None
+
+    # ---- 更新到哪个版本 ----
+    opts, idx_pre, idx_check = [], None, None
+    opts.append((f"已上线版本 {main_br['tag']}  (能直接进游戏)", "main"))
+    if pre_br and ver_key(pre_br.get("tag", "0")) > ver_key(main_br["tag"]):
+        idx_pre = len(opts) + 1
+        opts.append((f"预下载版本 {pre_br['tag']}  (还没开服, 装好等开服)", "pre_download"))
+    if lv:
+        idx_check = len(opts) + 1
+        opts.append((f"只检查当前 {lv} 是否完整 (不升级)", "check"))
+    pick = ask_menu("更新到哪个版本?", opts)
+
+    branch = {"main": "main", "pre_download": "predownload"}.get(pick, "main")
+
+    # ---- 更新哪些内容 ----
+    cat_opts = [
+        ("游戏资源 (10054) + 中文语音 (10055)   推荐", ["10054", "10055"]),
+        ("只更新 游戏资源 (10054)", ["10054"]),
+        ("游戏资源 + 中/英/日/韩 全部语音", None),
+    ]
+    cats = ask_menu("更新哪些内容?", cat_opts)
+
+    # ---- 先预览还是直接升级 ----
+    if pick == "check":
+        dry = True
+    else:
+        dry = ask_menu("要先看看要下载多少吗?", [
+            ("先预览, 不下载任何东西", True),
+            ("直接开始升级", False),
+        ], default=1)
+
+    return {"gamedir": gamedir, "branch": branch, "cats": cats, "dry": dry,
+            "check_only": pick == "check"}
+
+
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="星穹铁道(国服) 客户端升级 (不带参数运行=交互模式)")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__} (hkrpg_cn)")
     ap.add_argument("--branch", default="main",
                     help="main=已上线正式版(开服前停在上一版本); predownload=预下载(未开服的新版本, 装好等开服)")
-    ap.add_argument("--gamedir", required=True, help="低版本客户端根目录(要升级的目标, 含 StarRail_Data)")
+    ap.add_argument("--gamedir", default=None,
+                    help="低版本客户端根目录(要升级的目标, 含 StarRail_Data); 缺省则交互式询问")
     ap.add_argument("--cat", default=None, help="只跑指定类别(如 10054); 缺省=自动遍历全部类别")
     ap.add_argument("--cn", action="store_true", help="中文版: 只升 游戏资源(10054)+中文语音(10055), 不装英/日/韩")
     ap.add_argument("--dry", action="store_true", help="只预览, 不下载不写文件")
     ap.add_argument("--verify", action="store_true",
                     help="强制逐文件 md5 校验(慢, 会读整个客户端); 默认走清单比对, 秒出结果")
     a = ap.parse_args()
+
+    # 不带 --gamedir 就进入交互模式
+    interactive = a.gamedir is None
+    if interactive:
+        cfg = _interactive_setup()
+        if cfg is None:
+            print("\n已取消。"); return
+        a.gamedir = str(cfg["gamedir"])
+        a.branch = cfg["branch"]
+        a.dry = cfg["dry"]
+        if cfg["cats"] is None:
+            a.cn = False; a.cat = None          # 全部类别
+        elif cfg["cats"] == ["10054", "10055"]:
+            a.cn = True; a.cat = None
+        else:
+            a.cat = cfg["cats"][0]
+
     gamedir = pathlib.Path(a.gamedir)
     if not gamedir.is_dir():
         print("gamedir 不存在:", gamedir); sys.exit(1)
 
+    # 把参数折算成"要处理哪些类别"
+    if a.cat:
+        cat_id = [a.cat]
+    elif a.cn:
+        cat_id = ["10054", "10055"]
+    else:
+        cat_id = None
+
+    _do_update(gamedir, a.branch, cat_id, a.dry, a.verify)
+
+    # 交互模式且只是预览时, 问一句要不要接着真升级
+    if not (interactive and a.dry):
+        return
+    try:
+        ans = input("\n要现在正式升级吗? 会把上面的文件下载并写入客户端 [y/N]: ").strip().lower()
+    except EOFError:
+        return
+    if ans in ("y", "yes"):
+        _do_update(gamedir, a.branch, cat_id, False, a.verify)
+    else:
+        print("已取消。")
+
+def _do_update(gamedir, branch, cat_id, dry, verify):
+    """执行一次升级(或预览)。cat_id 为 None 表示全部类别, 否则是类别 id 列表。"""
     print("解析分支 ...")
     gb = load_branches()
-    br = pick_branch(gb, a.branch)
+    br = pick_branch(gb, branch)
     if not br:
-        print("找不到分支:", a.branch, " 可用:", ", ".join(gb.keys())); sys.exit(1)
+        print("找不到分支:", branch, " 可用:", ", ".join(gb.keys())); return
     other = gb.get("pre_download") if br.get("branch") != "predownload" else gb.get("main")
-    if a.branch == "main" and other and other.get("tag") != br.get("tag") and ver_key(other["tag"]) > ver_key(br["tag"]):
+    if branch == "main" and other and other.get("tag") != br.get("tag") and ver_key(other["tag"]) > ver_key(br["tag"]):
         # 只走默认分支时才提醒: 官方预下载里有更高版本, 想提前囤可以切过去
         print(f"  (提示: 官方另有 pre_download 分支 tag={other['tag']} 更高; 想提前下载可加 --branch predownload)")
     print(f"  目标版本: {br['tag']}   源(diff_tags): {br['diff_tags']}")
@@ -295,16 +427,14 @@ def main():
     manifests = bj["data"]["manifests"]
     print(f"  资源类别: {len(manifests)} 个")
 
-    if a.cat:
-        cats = [m for m in manifests if m["category_id"] == a.cat]
-    elif a.cn:
-        cats = [m for m in manifests if m["category_id"] in ("10054", "10055")]
+    if cat_id:
+        cats = [m for m in manifests if m["category_id"] in cat_id]
     else:
         cats = manifests
     if not cats:
-        print("找不到类别:", a.cat); sys.exit(1)
-    if a.cn:
-        print("  中文版模式: 仅 游戏资源(10054) + 中文语音(10055)")
+        print("找不到类别:", cat_id); return
+    if cat_id:
+        print(f"  仅处理: {', '.join(m.get('category_name', m['category_id']) for m in cats)}")
 
     # ---- 清单比对基准: 本地版本 == 官方某分支 tag 时, 用清单 md5 判断, 不读本地文件 ----
     src_tag = None
@@ -313,11 +443,10 @@ def main():
     if lv and ver_key(lv) > ver_key(br["tag"]):
         print(f"  [警告] 本地版本 {lv} 比目标版本 {br['tag']} 还新!")
         print(f"         继续会把你降级到 {br['tag']}。要升到更新的版本, 请加 --branch predownload")
-        if br["tag"] != "pre_download":
-            other = gb.get("pre_download")
-            if other and ver_key(other.get("tag", "0")) > ver_key(br["tag"]):
-                print(f"         (官方 pre_download 分支当前是 {other['tag']})")
-    if a.verify:
+        other2 = gb.get("pre_download")
+        if other2 and ver_key(other2.get("tag", "0")) > ver_key(br["tag"]):
+            print(f"         (官方 pre_download 分支当前是 {other2['tag']})")
+    if verify:
         print("  --verify: 强制逐文件 md5 校验 (会读整个客户端, 较慢)")
     elif lv:
         if ver_key(lv) == ver_key(br["tag"]):
@@ -328,20 +457,22 @@ def main():
         else:
             print(f"  本地版本 {lv} 不在官方分支列表里, 退回逐文件校验")
 
-    total=0
-    dl_total=0
+    total = 0
+    dl_total = 0
     index_cache = {} if src_tag else None
     start_all = time.time()
     for cat in cats:
-        n, b = process_category(cat, gamedir, a.dry, br, src_tag, index_cache, a.verify)
+        n, b = process_category(cat, gamedir, dry, br, src_tag, index_cache, verify)
         total += n; dl_total += b
     el_all = time.time() - start_all
-    print(f"\n== 全部完成 == 共处理类别 {len(cats)} 个, 新增/重组文件合计: {total} 个, 需下载 {dl_total/2**30:.2f} GiB, 目标版本 {br['tag']}, 总耗时 {el_all:.0f}s ({el_all/60:.1f} 分钟)")
-    if a.dry:
-        print("(--dry 预览, 未下载未写文件)")
+    print(f"\n== 全部完成 == 共处理类别 {len(cats)} 个, 新增/重组文件合计: {total} 个, "
+          f"需下载 {dl_total/2**30:.2f} GiB, 目标版本 {br['tag']}, 总耗时 {el_all:.0f}s ({el_all/60:.1f} 分钟)")
+    if dry:
+        print("(预览: 未下载未写文件)")
     else:
         set_config_version(gamedir, br["tag"])
         ask_clean_cache()
+
 
 if __name__ == "__main__":
     main()
