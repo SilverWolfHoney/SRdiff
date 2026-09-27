@@ -22,8 +22,7 @@ Python 3.8+（开发环境为 3.14）。
 | `voice_pack.py` | 只补充语音包（交互运行；测试服/精简客户端常用） |
 | `manifest.proto` / `manifest_pb2.py` | Sophon 清单的 proto 定义与生成物（日常不用管） |
 | `manifest_ldiff.proto` / `_pb2.py` | 官方差分包清单定义（当前未使用，保留备用） |
-| `gen_pb2.py` | 改了 `.proto` 后才需要跑：重新生成 `*_pb2.py` |
-| `SRdiff_voice.spec` | PyInstaller 打包配置：`pyinstaller SRdiff_voice.spec` 生成单文件 `dist/SRdiff_voice.exe` |
+| `gen_pb2.py` | 改了 `.proto` 后才需要跑：重新生成 `*_pb2.py`（需 `pip install grpcio-tools`） |
 
 ## 用法
 
