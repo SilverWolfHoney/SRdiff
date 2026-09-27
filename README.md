@@ -84,7 +84,7 @@ python build_exe.py
 
 **ldiff（差分）**：`getPatchBuild` 给出另一套清单，为**改动过**的文件提供补丁，每条补丁指明它在 CDN 上某个「补丁池文件」里的位置（`patch_offset`/`patch_length`）。官方 CDN 支持 HTTP Range，所以只下补丁段；补丁段是标准 HDiffPatch 格式（`HDIFF13&` + zstd），用 `hdiffpatch` 直接应用。
 
-省流量实测量级（4.5.0 → 4.6.0，国服 `--cn`）：全量下载 103 GiB → 差分**补丁段 3.34 GiB + 新增文件 8.76 GiB = 12.10 GiB**。详见 [NOTES.md](NOTES.md)。
+省流量实测量级（完整 4.5.0 客户端 → 4.6.0，国服 `--cn`）：全量升级需下载 18.55 GiB，走差分只需 **12.10 GiB**（补丁段 3.34 + 新增文件 8.76），省 6.45 GiB。差分省的是「内容改动」那部分；**新增文件省不掉**（官方不为不存在的文件生成补丁）。详见 [NOTES.md](NOTES.md)。
 
 ## 限制
 

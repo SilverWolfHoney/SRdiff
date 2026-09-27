@@ -207,20 +207,34 @@ def collect(cat, src, dry, outdir, workers, limit=0, src_man=None, tgt_dl=None,
 
     n_content = len(picked) - skipped_nosrc      # 本地存在且内容改动的文件
     n_rebuild = skipped_nosrc                    # 本地缺失、但补丁能直接重建的文件
+
+    # 全量升级(不用差分包)需要下载的压缩体积, 用来算"这次到底省了多少"
+    # 注意去重: picked 里可能已经含了部分新增文件(官方会给某些新增文件也发补丁), 不能重复计
+    upd_bytes = 0
+    if tgt_dl is not None:
+        upd_names = {v.filename for v, _pat in picked} | set(new_names)
+        upd_bytes = sum(tgt_dl.get(n, 0) for n in upd_names)
+
     print(f"  补丁覆盖 {len(picked)} 个文件: 本地需改动 {n_content} 个, "
           f"本地缺失可重建 {n_rebuild} 个")
     print(f"  无需处理(目标版本未改动) {skipped_unchanged} 个")
-    print(f"  补丁池 {len(pools)} 个, 补丁段需下载 {human(dl_bytes)}, 应用后产出 {human(new_bytes)}")
+    print(f"  补丁池 {len(pools)} 个, 补丁段需下载(压缩) {human(dl_bytes)}")
     if n_added:
-        print(f"  [注意] 另有 {n_added} 个文件是你本地没有、官方也没给补丁的(新增), 共 {human(added_dl)}")
+        print(f"  [注意] 另有 {n_added} 个文件是你本地没有、官方也没给补丁的(新增), "
+              f"下载(压缩) {human(added_dl)}")
         if with_new:
             print(f"         这些没有补丁可用, 将整份下载打包进 files\\ (对方即可离线升级)")
         else:
             print(f"         差分包覆盖不了, 只能全量下载(--no-new 未打包)")
+    if upd_bytes:
+        save = upd_bytes - dl_bytes - (added_dl if with_new else 0)
+        print(f"  对比: 不用差分包的全量升级需下载(压缩) {human(upd_bytes)} "
+              f"-> 用差分省 {human(save)}")
 
     if dry:
         return {"files": len(picked), "pools": len(pools), "dl": dl_bytes, "new": new_bytes,
                 "added_dl": added_dl, "n_added": n_added, "n_content": n_content,
+                "upd_bytes": upd_bytes,
                 "new_files": [], "n_new_bundled": 0, "new_bundled_bytes": 0,
                 "records": [], "deletes": dm.files_delete, "dry": True}
 
@@ -354,6 +368,7 @@ def collect(cat, src, dry, outdir, workers, limit=0, src_man=None, tgt_dl=None,
     return {"files": len(picked), "pools": len(pools), "dl": dl_bytes, "new": new_bytes,
             "records": records, "deletes": dm.files_delete, "dry": False, "gaps": gaps[0],
             "added_dl": added_dl, "n_added": n_added, "n_content": n_content,
+            "upd_bytes": upd_bytes,
             "new_files": new_records, "n_new_bundled": len(new_records),
             "new_bundled_bytes": new_bundled_bytes}
 
@@ -492,24 +507,25 @@ def main():
     n_added_total = sum(s.get("n_added", 0) for s in stats)
     n_content_total = sum(s.get("n_content", 0) for s in stats)
     bund_total = sum(s.get("new_bundled_bytes", 0) for s in stats)
+    upd_total = sum(s.get("upd_bytes", 0) for s in stats)
     el = time.time() - start
     print(f"\n== 汇总 == 类别 {len(cats)} 个, 补丁池 {sum(s['pools'] for s in stats)} 个")
     print(f"  补丁覆盖 {sum(s['files'] for s in stats)} 个文件 "
           f"(本地需改动 {n_content_total}, 本地缺失可重建 {sum(s.get('n_rebuild', 0) for s in stats)})")
-    print(f"  补丁段需下载: {human(dl_total)}   应用后产出: {human(new_total)}   耗时 {el:.0f}s")
-    if added_dl_total:
-        if a.with_new:
-            if a.dry:
-                print(f"  新增文件 {n_added_total} 个将一并打包(整份内容, 预览未下载): {human(added_dl_total)}")
-                print(f"  => 完整包预计 {human(dl_total + added_dl_total)} (未压缩)")
-            else:
-                print(f"  新增文件 {len(all_new_files)} 个已一并打包(整份内容): {human(bund_total)}")
-                print(f"  => 本包合计 {human(dl_total + bund_total)} (未压缩)")
-                print(f"     对方只需本包 + 应用工具即可完成 {src} -> {tgt}, 不用再访问官方。")
-        else:
-            print(f"  另有新增文件 {n_added_total} 个(官方无补丁): {human(added_dl_total)} —— 未打包(--no-new)")
-            print(f"  => 对方还需要自己从官方下载这部分; 本包 + 官方下载 ≈ {human(dl_total + added_dl_total)}")
-            print(f"     想要一个能离线升级的完整包, 去掉 --no-new 重跑(补丁池已下载, 会跳过)")
+    print(f"  本次真实网络下载量(压缩) ≈ 补丁段 {human(dl_total)}"
+          + (f" + 新增文件 {human(added_dl_total)} = {human(dl_total + added_dl_total)}"
+             if added_dl_total else f" = {human(dl_total)}")
+          + f"   耗时 {el:.0f}s")
+    if upd_total:
+        print(f"  对比: 不用差分包的全量升级需下载(压缩) {human(upd_total)} "
+              f"-> 省 {human(upd_total - dl_total - added_dl_total)}")
+    if all_new_files:
+        print(f"  导出目录(落盘, 未压缩): {human(dl_total + bund_total)}   "
+              f"(补丁段 {human(dl_total)} + 新增文件 {human(bund_total)}, 建议压成 7z 再分享)")
+    if not a.dry:
+        print(f"  应用端还需下载: 无需(包内已含全部内容)")
+    if not a.with_new and added_dl_total and not a.dry:
+        print(f"      (想要能离线升级的完整包, 去掉 --no-new 重跑; 补丁池已下载会跳过)")
 
     if a.dry:
         print("\n(--dry 预览: 未下载、未写文件)")
