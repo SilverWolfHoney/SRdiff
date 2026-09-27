@@ -71,6 +71,22 @@ python voice_pack.py --gamedir "<客户端根目录>" --lang cn,jp --branch pred
 - 它用**逐文件 md5 校验**：本地已有的语音文件会跳过，只补缺失或损坏的（可中断、重跑接着补）。
   > 语音包这里刻意**不**用「按版本号做清单比对」——测试服/精简版的版本号常与正式服不同，万一恰好相同，就会被误判成"语音包已存在"而不去补。
 
+### 打包成 exe（发给别人用）
+
+```bash
+pip install pyinstaller
+python build_exe.py            # 产物: dist\SRdiff_voice.exe (约 9.7 MB)
+```
+
+`dist\SRdiff_voice.exe` 是单文件，双击即可用（结束时会停住让你看清结果），也可以命令行调用：
+
+```
+SRdiff_voice.exe                                              # 双击：交互式
+SRdiff_voice.exe --gamedir "<客户端>" --lang cn,jp --dry       # 命令行
+```
+
+依赖（protobuf / zstandard）已打进 exe，**接收方不需要装 Python**。
+
 ## 常用参数
 
 | 参数 | 说明 |

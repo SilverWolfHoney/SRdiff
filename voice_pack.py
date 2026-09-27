@@ -14,6 +14,20 @@ import sophon_update as S
 
 __version__ = "1.0"
 
+# 交互模式 + 打包成 exe 时, 结束时停一下, 免得双击运行看不到结果窗口就关了
+_INTERACTIVE = False
+
+def wait_exit(msg="按回车键关闭 ...", force=False):
+    """打包成 exe 时, 出错或结束都停一下让用户看清输出; 命令行带参数调用不打扰。"""
+    if not getattr(sys, "frozen", False):
+        return
+    if not (force or _INTERACTIVE):
+        return
+    try:
+        input("\n" + msg)
+    except Exception:
+        pass
+
 # 语音类别: id -> (语言代码, 显示名, 游戏内目录名)
 LANGS = [
     ("10055", "cn", "中文", "Chinese(PRC)"),
@@ -80,6 +94,7 @@ def setup_official(cid_list, branch):
 
 
 def main():
+    global _INTERACTIVE
     ap = argparse.ArgumentParser(description="给客户端补充官方语音包(交互运行更省事)")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__} (hkrpg_cn)")
     ap.add_argument("--gamedir", default=None, help="要补充语音包的客户端根目录(含 StarRail_Data)")
@@ -91,6 +106,7 @@ def main():
     a = ap.parse_args()
 
     interactive = a.gamedir is None or a.lang is None or a.branch is None
+    _INTERACTIVE = interactive
     if interactive:
         print("=" * 58)
         print("  SRdiff — 语音包补充工具 (星穹铁道 国服)")
@@ -100,11 +116,11 @@ def main():
     if a.gamedir is None:
         gamedir = ask_path("\n要补充语音包的客户端根目录 (含 StarRail_Data): ")
         if gamedir is None:
-            print("已取消。"); return
+            print("已取消。"); wait_exit(); return
     else:
         gamedir = pathlib.Path(a.gamedir)
     if not gamedir.is_dir():
-        print("目录不存在:", gamedir); sys.exit(1)
+        print("目录不存在:", gamedir); wait_exit(); sys.exit(1)
     if not (gamedir / "StarRail_Data").is_dir():
         print(f"  [警告] {gamedir} 下没有 StarRail_Data, 可能不是客户端根目录")
 
@@ -127,7 +143,7 @@ def main():
         codes = picked
     bad = [c for c in codes if c not in BY_CODE]
     if bad:
-        print(f"  不认识的语言代码: {bad}  (可用: cn,en,jp,kr)"); sys.exit(1)
+        print(f"  不认识的语言代码: {bad}  (可用: cn,en,jp,kr)"); wait_exit(); sys.exit(1)
 
     # ---- 取哪个版本的语音包 ----
     if a.branch:
@@ -141,9 +157,9 @@ def main():
     print("\n正在查询官方版本 ...")
     try:
         if not setup_official([BY_CODE[c][0] for c in codes], branch):
-            sys.exit(1)
+            wait_exit(); sys.exit(1)
     except Exception as e:
-        print(f"  查询失败: {e}"); sys.exit(1)
+        print(f"  查询失败: {e}"); wait_exit(); sys.exit(1)
 
     # ---- 先预览还是直接下载 ----
     if a.dry:
@@ -176,6 +192,7 @@ def main():
         else:
             print("已取消。")
     print(f"\n语音包目录: {gamedir / 'StarRail_Data' / 'Persistent' / 'Audio' / 'AudioPackage' / 'Windows'}")
+    wait_exit()
 
 
 if __name__ == "__main__":
