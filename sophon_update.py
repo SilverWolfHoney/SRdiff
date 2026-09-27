@@ -396,10 +396,17 @@ def main():
     else:
         cat_id = None
 
-    _do_update(gamedir, a.branch, cat_id, a.dry, a.verify)
+    # 交互模式选了"只检查完整性"时, 目标就是本地版本自己
+    mylv = None
+    if interactive and cfg.get("check_only"):
+        mylv = local_version(gamedir)
+        a.dry = True
+
+    _do_update(gamedir, a.branch, cat_id, a.dry, a.verify, mylv)
 
     # 交互模式且只是预览时, 问一句要不要接着真升级
-    if not (interactive and a.dry):
+    # (选了"只检查完整性"就不问: 那本来就不是升级)
+    if not (interactive and a.dry and mylv is None):
         return
     try:
         ans = input("\n要现在正式升级吗? 会把上面的文件下载并写入客户端 [y/N]: ").strip().lower()
@@ -410,15 +417,25 @@ def main():
     else:
         print("已取消。")
 
-def _do_update(gamedir, branch, cat_id, dry, verify):
-    """执行一次升级(或预览)。cat_id 为 None 表示全部类别, 否则是类别 id 列表。"""
+def _do_update(gamedir, branch, cat_id, dry, verify, check_ver=None):
+    """执行一次升级(或预览)。cat_id 为 None 表示全部类别, 否则是类别 id 列表。
+    check_ver 非空时=只核对这个本地版本是否完整(不升级), 用它的官方清单当目标。"""
     print("解析分支 ...")
     gb = load_branches()
-    br = pick_branch(gb, branch)
-    if not br:
-        print("找不到分支:", branch, " 可用:", ", ".join(gb.keys())); return
+    if check_ver:
+        # 只检查模式: 目标就是本地版本本身, 不能拿 main 分支去核对(否则会误判要"升级")
+        br = branch_by_tag(gb, check_ver)
+        if not br:
+            print(f"  官方分支列表里没有 {check_ver}, 无法核对(可能是很旧的版本)")
+            return
+        print(f"  只核对本地版本 {check_ver}: 用官方 {check_ver} 清单逐项比对")
+    else:
+        br = pick_branch(gb, branch)
+        if not br:
+            print("找不到分支:", branch, " 可用:", ", ".join(gb.keys())); return
     other = gb.get("pre_download") if br.get("branch") != "predownload" else gb.get("main")
-    if branch == "main" and other and other.get("tag") != br.get("tag") and ver_key(other["tag"]) > ver_key(br["tag"]):
+    if not check_ver and branch == "main" and other and other.get("tag") != br.get("tag") \
+            and ver_key(other["tag"]) > ver_key(br["tag"]):
         # 只走默认分支时才提醒: 官方预下载里有更高版本, 想提前囤可以切过去
         print(f"  (提示: 官方另有 pre_download 分支 tag={other['tag']} 更高; 想提前下载可加 --branch predownload)")
     print(f"  目标版本: {br['tag']}   源(diff_tags): {br['diff_tags']}")
